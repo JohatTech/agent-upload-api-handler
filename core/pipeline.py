@@ -1,0 +1,449 @@
+"""
+The orchestrator. Given a project folder path, this module:
+  1. Discovers every supported file inside it.
+  2. Loads & chunks each file in parallel.
+  3. Enriches every chunk with project + file metadata.
+  4. Pushes the combined chunk list to all configured vector stores.
+  5. Notifies N8N, Power Automate, Frontend, and the Chat Responder.
+"""
+
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+import json
+
+from langchain_core.documents import Document
+
+import config
+from core.loaders import discover_files, load_and_chunk_file
+from core.enrichment import enrich_chunks
+from core.vectorstore_manager import push_to_all_targets
+from core.utils import format_bytes, set_collection_name
+from core.notifier import notify_power_automate, notify_frontend, notify_chat_responder, get_project_title_from_responder
+
+from agent_module.agent_system import AutonomousRAGAgent
+from agent_module.report_generator import generate_report
+from agent_module.rag_responder import RAGResponder
+from supabase_module.supabase_client import SupabaseModule
+
+logger = logging.getLogger("pipeline")
+
+
+def _load_single_file(file_path: Path) -> tuple[Path, list[Document]]:
+    chunks = load_and_chunk_file(file_path)
+    return file_path, chunks
+
+
+def _update_event_metadata(event_metadata: dict[str, Any] | None, **kwargs: Any) -> None:
+    if event_metadata is not None:
+        event_metadata.update(kwargs)
+
+
+def process_project_folder(
+    folder_path: str | Path,
+    model_name: str | None = None,
+    event_metadata: dict[str, Any] | None = None,
+) -> int:
+    folder = Path(folder_path)
+    project_name = folder.name
+    target_model = model_name or config.DEFAULT_CHAT_MODEL
+    event_metadata = event_metadata or {}
+    _update_event_metadata(
+        event_metadata,
+        project_name=project_name,
+        model_name=target_model,
+        process_type="folder",
+    )
+    
+    parts = project_name.split("_")
+    email = parts[0] if parts else None
+
+    logger.info("=" * 70)
+    logger.info("PIPELINE START  │  project='%s'  │  model='%s'", project_name, target_model)
+    logger.info("=" * 70)
+
+    start_time = time.perf_counter()
+
+    # Step 1: Connect to Supabase and register the START of everything immediately in pipeline_jobs
+    vector_store_id = set_collection_name(project_name)
+    try:
+        supabase_module = SupabaseModule()
+        job_id = supabase_module.create_pipeline_job(
+            project_name="Nuevo proyecto añadido", 
+            status="triggered",
+            vector_store_id=vector_store_id
+        )
+    except Exception as e:
+        logger.error("Failed to init supabase job: %s", e)
+        job_id = None
+        supabase_module = None
+
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(job_id, status="vectorizing")
+
+    # Notify frontend that the notebook is processing BEFORE vectorization
+    try:
+        notify_frontend(
+            project_name="Nuevo proyecto añadido",
+            vector_store_id=vector_store_id,
+            total_chunks=0,
+            status="processing",
+            file_count=0,
+        )
+    except Exception as exc:
+        logger.error("Failed to pre-register notebook on frontend: %s", exc)
+
+    # Discover files
+    files = discover_files(folder)
+    if not files:
+        logger.warning("No supported files found in '%s'. Nothing to do.", project_name)
+        _update_event_metadata(event_metadata, processed_ok=False, total_chunks=0)
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(job_id, status="failed")
+        return 0
+
+    # Load & chunk in parallel
+    all_chunks: list[Document] = []
+
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_load_single_file, f): f
+            for f in files
+        }
+
+        for future in as_completed(futures):
+            file_path = futures[future]
+            try:
+                _, chunks = future.result()
+            except Exception as exc:
+                logger.error("Worker failed for '%s': %s", file_path.name, exc)
+                continue
+
+            if not chunks:
+                continue
+
+            # Enrich metadata
+            enrich_chunks(chunks, project_name=project_name, source_file=file_path)
+            all_chunks.extend(chunks)
+
+    total_content_size = sum(len(chunk.page_content.encode('utf-8')) for chunk in all_chunks)
+
+    logger.info(
+        "Loading complete  │  files=%d  │  total_chunks=%d  │  total_content_size=%s  │  %.2fs",
+        len(files),
+        len(all_chunks),
+        format_bytes(total_content_size) if all_chunks else "0 B",
+        time.perf_counter() - start_time,
+    )
+
+    if not all_chunks:
+        logger.warning("All files produced zero chunks. Nothing to push.")
+        _update_event_metadata(event_metadata, processed_ok=False, total_chunks=0)
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(job_id, status="failed")
+        return 0
+
+    # Push to vector stores (Supabase)
+    push_to_all_targets(all_chunks, project_name)
+
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(job_id, status="vectorization_finished")
+
+    # Determine natural language project name after vectorization completes
+    natural_project_name = project_name
+    try:
+        natural_project_name = get_project_title_from_responder(project_name)
+    except Exception as exc:
+        logger.error("Failed to determine project name via responder server: %s", exc)
+
+    # Pre-register vector ID and mapping with Chat Responder microservice
+    vector_store_id = set_collection_name(project_name)
+    notify_chat_responder(
+        project_name=project_name,
+        vector_store_id=vector_store_id,
+        natural_project_name=natural_project_name,
+    )
+
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(job_id, status="responder_notified")
+
+    # Notify frontend that the notebook is processing
+    try:
+        notify_frontend(
+            project_name=natural_project_name,
+            vector_store_id=vector_store_id,
+            total_chunks=len(all_chunks),
+            status="processing",
+            file_count=len(files),
+        )
+    except Exception as exc:
+        logger.error("Failed to pre-register notebook on frontend: %s", exc)
+
+    # Run Autonomous RAG Agent & Reporting
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(
+            job_id, 
+            status="generating_report", 
+            project_name=natural_project_name,
+            total_chunks=len(all_chunks), 
+            file_count=len(files), 
+            vector_store_id=vector_store_id
+        )
+
+    report_generated = False
+    report_sent = False
+    report_path = None
+    report_summary = ""
+    report_md = None
+    try:
+        logger.info("Step 5: Running Autonomous RAG Agent ...")
+        prompts_path = Path("pliego_form.json")
+        prompts = []
+        
+        if prompts_path.exists():
+            with open(prompts_path, "r", encoding="utf-8") as f:
+                prompts_data = json.load(f)
+                prompts = [item for item in prompts_data if isinstance(item, str)]
+        
+        if prompts:
+            agent = AutonomousRAGAgent(project_name, model_name="CLAUDE", job_id=job_id)
+            report_md = agent.process_prompts(prompts)
+            if report_md:
+                clean_summary = report_md.strip()
+                for prefix in ["# ", "## ", "### "]:
+                    if clean_summary.startswith(prefix):
+                        clean_summary = clean_summary[len(prefix):]
+                report_summary = clean_summary[:500] + "..." if len(clean_summary) > 500 else clean_summary
+            
+            # Generate PDF report
+            logger.info("Step 6: Generating PDF report ...")
+            pdf_path = generate_report(project_name, report_md, model_name="CLAUDE")
+            report_generated = bool(pdf_path)
+            report_path = str(pdf_path) if pdf_path else None
+            logger.info("Report Path: %s", pdf_path)
+
+            # Send to Power Automate
+            if email and pdf_path:
+                logger.info("Step 7: Sending report to Power Automate for %s ...", email)
+                report_sent = notify_power_automate(project_name, email, pdf_path)
+        else:
+            logger.warning("No prompts available for RAG analysis.")
+
+    except Exception as e:
+        logger.error("Agentic RAG/Reporting failed for '%s': %s", project_name, e, exc_info=True)
+        _update_event_metadata(event_metadata, processed_ok=False, error=str(e))
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(job_id, status="failed")
+    else:
+        _update_event_metadata(
+            event_metadata,
+            processed_ok=True,
+            report_generated=report_generated,
+            report_sent=report_sent,
+            report_path=report_path,
+            total_chunks=len(all_chunks),
+        )
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(
+                job_id,
+                status="completed" if report_generated else "failed",
+                report_summary=report_summary,
+                pdf_path=report_path
+            )
+
+    # Notify frontend of completion
+    notify_frontend(
+        project_name=natural_project_name,
+        vector_store_id=vector_store_id,
+        total_chunks=len(all_chunks),
+        status="ready" if report_generated else "error",
+        pdf_path=report_path,
+        report_summary=report_summary,
+        file_count=len(files),
+    )
+
+    elapsed = time.perf_counter() - start_time
+    logger.info("PIPELINE DONE  │  project='%s'  │  model='%s'  │  %.2fs", project_name, target_model, elapsed)
+    return len(all_chunks)
+
+
+def process_blob_file(
+    file_path: str | Path,
+    project_name: str,
+    model_name: str | None = None,
+    event_metadata: dict[str, Any] | None = None,
+) -> int:
+    path = Path(file_path)
+    target_model = model_name or config.DEFAULT_CHAT_MODEL
+    event_metadata = event_metadata or {}
+    _update_event_metadata(
+        event_metadata,
+        project_name=project_name,
+        model_name=target_model,
+        process_type="blob",
+    )
+    
+    parts = project_name.split("_")
+    email = parts[0] if parts else None
+
+    logger.info("=" * 70)
+    logger.info("BLOB PIPELINE START  │  project='%s'  │  file='%s'  │  model='%s'", project_name, path.name, target_model)
+    logger.info("=" * 70)
+
+    # Step 1: Connect to Supabase and register the START of everything immediately in pipeline_jobs
+    vector_store_id = set_collection_name(project_name)
+    try:
+        supabase_module = SupabaseModule()
+        job_id = supabase_module.create_pipeline_job(
+            project_name="Nuevo proyecto añadido", 
+            status="triggered",
+            vector_store_id=vector_store_id
+        )
+    except Exception as e:
+        logger.error("Failed to init supabase job: %s", e)
+        job_id = None
+        supabase_module = None
+
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(job_id, status="vectorizing")
+
+    # Notify frontend that the notebook is processing BEFORE vectorization
+    try:
+        notify_frontend(
+            project_name="Nuevo proyecto añadido",
+            vector_store_id=vector_store_id,
+            total_chunks=0,
+            status="processing",
+            file_count=1,
+        )
+    except Exception as exc:
+        logger.error("Failed to pre-register notebook on frontend: %s", exc)
+
+    # Load & chunk
+    chunks = load_and_chunk_file(path)
+    if not chunks:
+        _update_event_metadata(event_metadata, processed_ok=False, total_chunks=0)
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(job_id, status="failed")
+        return 0
+
+    # Enrich metadata
+    enrich_chunks(chunks, project_name=project_name, source_file=path)
+
+    # Push to vector stores (Supabase)
+    push_to_all_targets(chunks, project_name)
+
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(job_id, status="vectorization_finished")
+
+    # Determine natural language project name after vectorization completes
+    natural_project_name = project_name
+    try:
+        natural_project_name = get_project_title_from_responder(project_name)
+    except Exception as exc:
+        logger.error("Failed to determine project name via responder server: %s", exc)
+
+    # Pre-register vector ID and mapping with Chat Responder microservice
+    vector_store_id = set_collection_name(project_name)
+    notify_chat_responder(
+        project_name=project_name,
+        vector_store_id=vector_store_id,
+        natural_project_name=natural_project_name,
+    )
+
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(job_id, status="responder_notified")
+
+    # Notify frontend that the notebook is processing
+    try:
+        notify_frontend(
+            project_name=natural_project_name,
+            vector_store_id=vector_store_id,
+            total_chunks=len(chunks),
+            status="processing",
+            file_count=1,
+        )
+    except Exception as exc:
+        logger.error("Failed to pre-register notebook on frontend: %s", exc)
+
+    # Agentic RAG & Reporting
+    if job_id and supabase_module:
+        supabase_module.update_pipeline_job(
+            job_id, 
+            status="generating_report", 
+            project_name=natural_project_name,
+            total_chunks=len(chunks), 
+            file_count=1, 
+            vector_store_id=vector_store_id
+        )
+
+    report_generated = False
+    report_sent = False
+    report_path = None
+    report_summary = ""
+    report_md = None
+
+    try:
+        prompts_path = Path("pliego_form.json")
+        prompts = []
+        if prompts_path.exists():
+            with open(prompts_path, "r", encoding="utf-8") as f:
+                prompts_data = json.load(f)
+                prompts = [item for item in prompts_data if isinstance(item, str)]
+        
+        if prompts:
+            agent = AutonomousRAGAgent(project_name, model_name="CLAUDE", job_id=job_id)
+            report_md = agent.process_prompts(prompts)
+            if report_md:
+                clean_summary = report_md.strip()
+                for prefix in ["# ", "## ", "### "]:
+                    if clean_summary.startswith(prefix):
+                        clean_summary = clean_summary[len(prefix):]
+                report_summary = clean_summary[:500] + "..." if len(clean_summary) > 500 else clean_summary
+            
+            # Generate PDF report
+            pdf_path = generate_report(project_name, report_md, model_name="CLAUDE")
+            report_generated = bool(pdf_path)
+            report_path = str(pdf_path) if pdf_path else None
+            
+            # Power Automate
+            if email and pdf_path:
+                report_sent = notify_power_automate(project_name, email, pdf_path)
+        else:
+            logger.warning("No prompts available for RAG analysis.")
+    except Exception as e:
+        logger.error("Agentic RAG/Reporting failed for blob '%s': %s", path.name, e, exc_info=True)
+        _update_event_metadata(event_metadata, processed_ok=False, error=str(e))
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(job_id, status="failed")
+    else:
+        _update_event_metadata(
+            event_metadata,
+            processed_ok=True,
+            report_generated=report_generated,
+            report_sent=report_sent,
+            report_path=report_path,
+            total_chunks=len(chunks),
+        )
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(
+                job_id,
+                status="completed" if report_generated else "failed",
+                report_summary=report_summary,
+                pdf_path=report_path
+            )
+
+    # Notify frontend of completion
+    notify_frontend(
+        project_name=natural_project_name,
+        vector_store_id=vector_store_id,
+        total_chunks=len(chunks),
+        status="ready" if report_generated else "error",
+        pdf_path=report_path,
+        report_summary=report_summary,
+        file_count=1,
+    )
+
+    return len(chunks)
