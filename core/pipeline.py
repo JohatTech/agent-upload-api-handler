@@ -447,3 +447,103 @@ def process_blob_file(
     )
 
     return len(chunks)
+
+def regenerate_report(
+    project_name: str,
+    vector_store_id: str,
+    model_name: str | None = None,
+    notebook_id: str | None = None,
+) -> bool:
+    """
+    Regenerates the RAG report without re-vectorizing.
+    """
+    target_model = model_name or config.DEFAULT_CHAT_MODEL
+    logger.info("=" * 70)
+    logger.info("REGENERATE REPORT START │ project='%s' │ vector_store_id='%s' │ model='%s'", project_name, vector_store_id, target_model)
+    logger.info("=" * 70)
+
+    # Determine natural language project name first from notebooks table
+    natural_project_name = project_name
+    try:
+        supabase_module = SupabaseModule()
+        res = supabase_module.client.table("notebooks").select("name").eq("vector_store_id", vector_store_id).limit(1).execute()
+        if res.data and len(res.data) > 0:
+            natural_project_name = res.data[0]["name"]
+            logger.info("Found natural project name in database for redo: '%s'", natural_project_name)
+    except Exception as e:
+        logger.error("Failed to query natural project name for redo: %s", e)
+
+    try:
+        supabase_module = SupabaseModule()
+        job_id = supabase_module.create_pipeline_job(
+            project_name=natural_project_name, 
+            status="generating_report",
+            vector_store_id=vector_store_id,
+            notebook_id=notebook_id,
+        )
+    except Exception as e:
+        logger.error("Failed to init supabase job: %s", e)
+        job_id = None
+        supabase_module = None
+
+    report_generated = False
+    report_sent = False
+    report_path = None
+    report_summary = ""
+    report_md = None
+
+    try:
+        prompts_path = Path("pliego_form.json")
+        prompts = []
+        if prompts_path.exists():
+            with open(prompts_path, "r", encoding="utf-8") as f:
+                prompts_data = json.load(f)
+                prompts = [item for item in prompts_data if isinstance(item, str)]
+        
+        if prompts:
+            agent = AutonomousRAGAgent(project_name, model_name="CLAUDE", job_id=job_id, vector_store_id=vector_store_id)
+            report_md = agent.process_prompts(prompts)
+            if report_md:
+                clean_summary = report_md.strip()
+                for prefix in ["# ", "## ", "### "]:
+                    if clean_summary.startswith(prefix):
+                        clean_summary = clean_summary[len(prefix):]
+                report_summary = clean_summary[:500] + "..." if len(clean_summary) > 500 else clean_summary
+            
+            # Generate PDF report
+            pdf_path = generate_report(project_name, report_md, model_name="CLAUDE")
+            report_generated = bool(pdf_path)
+            report_path = str(pdf_path) if pdf_path else None
+            
+            # Power Automate (extract email from project_name if present)
+            parts = project_name.split("_")
+            email = parts[0] if parts else None
+            if email and pdf_path:
+                report_sent = notify_power_automate(project_name, email, pdf_path)
+        else:
+            logger.warning("No prompts available for RAG analysis.")
+    except Exception as e:
+        logger.error("Agentic RAG/Reporting failed during regeneration for '%s': %s", project_name, e, exc_info=True)
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(job_id, status="failed")
+    else:
+        if job_id and supabase_module:
+            supabase_module.update_pipeline_job(
+                job_id,
+                status="completed" if report_generated else "failed",
+                report_summary=report_summary,
+                pdf_path=report_path
+            )
+
+    # Notify frontend of completion
+    notify_frontend(
+        project_name=natural_project_name,
+        vector_store_id=vector_store_id,
+        total_chunks=0,
+        status="ready" if report_generated else "error",
+        pdf_path=report_path,
+        report_summary=report_summary,
+        file_count=0,
+    )
+
+    return report_generated

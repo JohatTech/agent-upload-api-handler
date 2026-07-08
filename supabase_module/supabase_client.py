@@ -181,3 +181,34 @@ class SupabaseModule:
         except Exception as exc:
             logger.error("Failed to update pipeline job %s: %s", job_id, exc)
 
+    def upload_file_to_storage(self, bucket_name: str, file_path: str, object_name: str) -> bool:
+        """Upload a file to Supabase Storage. Creates the bucket if it doesn't exist."""
+        try:
+            # Check if bucket exists, if not create it
+            try:
+                self.client.storage.get_bucket(bucket_name)
+            except Exception:
+                logger.info("Bucket '%s' not found. Creating it...", bucket_name)
+                self.client.storage.create_bucket(bucket_name, {"public": True})
+
+            with open(file_path, "rb") as f:
+                res = self.client.storage.from_(bucket_name).upload(
+                    path=object_name,
+                    file=f,
+                    file_options={"upsert": "true"}
+                )
+            logger.info("Successfully uploaded %s to bucket %s", object_name, bucket_name)
+            return True
+        except Exception as exc:
+            logger.error("Failed to upload file to storage: %s", exc)
+            return False
+
+    def get_public_url(self, bucket_name: str, object_name: str) -> str:
+        """Get the public URL for an object in Supabase Storage."""
+        try:
+            res = self.client.storage.from_(bucket_name).get_public_url(object_name)
+            return res
+        except Exception as exc:
+            logger.error("Failed to get public URL: %s", exc)
+            return ""
+

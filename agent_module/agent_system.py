@@ -29,11 +29,11 @@ def get_llm(model_name: str | None = None):
         raise e
 
 class AutonomousRAGAgent:
-    def __init__(self, project_name: str, model_name: str | None = None, job_id: str | None = None):
+    def __init__(self, project_name: str, model_name: str | None = None, job_id: str | None = None, vector_store_id: str | None = None):
         self.project_name = project_name
         self.model_name = model_name or config.DEFAULT_CHAT_MODEL
         self.job_id = job_id
-        self.collection_name = set_collection_name(project_name)
+        self.collection_name = vector_store_id or set_collection_name(project_name)
         self.embeddings = get_embeddings()
         
         # Initialize LLM using the registry

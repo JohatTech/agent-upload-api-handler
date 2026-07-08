@@ -9,8 +9,9 @@ from pydantic import BaseModel
 
 import config
 from agent_module.rag_responder import RAGResponder
-from core.pipeline import process_project_folder
+from core.pipeline import process_project_folder, regenerate_report
 from core.utils import set_collection_name
+from supabase_module.supabase_client import SupabaseModule
 
 # --- Logging --------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +73,12 @@ class AgentRequest(BaseModel):
     question: Optional[str] = None
     message: Optional[str] = None
 
+class GenerateReportRequest(BaseModel):
+    vector_store_id: str
+    project_name: str
+    model_name: Optional[str] = None
+    notebook_id: Optional[str] = None
+
 # --- Routes ---------------------------------------------------------------------
 @app.get("/api/health")
 def health():
@@ -108,6 +115,7 @@ async def upload_files(
     project_dir.mkdir(exist_ok=True)
 
     try:
+        supabase_module = SupabaseModule()
         # Save each uploaded file to the temporary directory
         for upload_file in files:
             file_ext = Path(upload_file.filename).suffix.lower()
@@ -121,6 +129,10 @@ async def upload_files(
             with dest_path.open("wb") as buffer:
                 shutil.copyfileobj(upload_file.file, buffer)
             logger.info("Saved file: %s", dest_path)
+            
+            # Upload to Supabase Storage
+            object_name = f"{project_name}/{upload_file.filename}"
+            supabase_module.upload_file_to_storage("project_files", str(dest_path), object_name)
     except HTTPException:
         # Re-raise HTTP exceptions (like unsupported file types)
         if project_dir.exists():
@@ -170,8 +182,8 @@ def handle_agent_event(payload: AgentRequest):
         try:
             logger.info("RAG Query received for project '%s': %s", project_name, question)
             responder = RAGResponder(model_name=model_name)
-            answer = responder.respond_chat(project_name, question)
-            return {"response": answer}
+            answer_data = responder.respond_chat(project_name, question)
+            return answer_data
         except Exception as exc:
             logger.exception("Chat responder failed")
             raise HTTPException(
@@ -183,3 +195,33 @@ def handle_agent_event(payload: AgentRequest):
             status_code=400,
             detail=f"Event type '{event_type}' is not supported on this server. Use 'chat'."
         )
+
+@app.post("/api/generate-report")
+async def generate_report_endpoint(
+    payload: GenerateReportRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Endpoint to trigger report regeneration from an existing vector store ID.
+    This skips the vectorization phase.
+    """
+    logger.info(
+        "Received report regeneration request for project '%s' (vector_store_id: '%s')",
+        payload.project_name,
+        payload.vector_store_id
+    )
+    
+    background_tasks.add_task(
+        regenerate_report,
+        project_name=payload.project_name,
+        vector_store_id=payload.vector_store_id,
+        model_name=payload.model_name,
+        notebook_id=payload.notebook_id,
+    )
+
+    return {
+        "status": "accepted",
+        "message": "Report regeneration triggered in the background.",
+        "project_name": payload.project_name,
+        "vector_store_id": payload.vector_store_id
+    }

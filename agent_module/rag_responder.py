@@ -82,7 +82,7 @@ class RAGResponder:
             logger.error("RAGResponder  │  Failed to generate project title via LLM: %s", e)
             return project_name
 
-    def respond_chat(self, project_name: str, question: str) -> str:
+    def respond_chat(self, project_name: str, question: str) -> dict:
         """
         Perform a RAG search on the project's vector store and answer the question.
         """
@@ -102,10 +102,31 @@ class RAGResponder:
                 }
             ).execute()
 
-            context = "\n\n".join([f"Documento {i+1}:\n{item.get('content', '')}" for i, item in enumerate(res.data)])
+            sources = []
+            context = ""
+            for i, item in enumerate(res.data):
+                doc_idx = i + 1
+                metadata = item.get('metadata', {})
+                content = item.get('content', '')
+                
+                source_file = metadata.get('source_file', 'Desconocido')
+                page = metadata.get('page')
+                
+                # Get public URL if possible (assuming bucket name is 'project_files')
+                object_name = f"{project_name}/{source_file}"
+                file_url = supabase_module.get_public_url("project_files", object_name)
+                
+                sources.append({
+                    "id": doc_idx,
+                    "sourceFile": source_file,
+                    "page": page,
+                    "content": content[:300] + "..." if len(content) > 300 else content,
+                    "fileUrl": file_url
+                })
+                context += f"\n\nDocumento [{doc_idx}]:\n{content}"
         except Exception as e:
             logger.exception("RAGResponder  │  Failed to query Supabase for chat message")
-            return "Lo siento, hubo un error al consultar la base de datos del proyecto."
+            return {"response": "Lo siento, hubo un error al consultar la base de datos del proyecto.", "sources": []}
 
         prompt = ChatPromptTemplate.from_messages([
             ("system",
@@ -115,7 +136,8 @@ class RAGResponder:
              "Reglas:\n"
              "- Responde de manera clara, concisa y profesional.\n"
              "- Responde en español.\n"
-             "- Mantén la respuesta enfocada en los datos reales del pliego."
+             "- Mantén la respuesta enfocada en los datos reales del pliego.\n"
+             "- Cita SIEMPRE la información extraída de los documentos usando el formato de corchetes con el número del documento, por ejemplo [1], [2]."
             ),
             ("human", "Contexto del proyecto:\n{context}\n\nPregunta: {question}")
         ])
@@ -123,7 +145,7 @@ class RAGResponder:
         try:
             chain = prompt | self.llm
             response = chain.invoke({"context": context, "question": question})
-            return response.content.strip()
+            return {"response": response.content.strip(), "sources": sources}
         except Exception as e:
             logger.error("RAGResponder  │  Failed to generate chat response: %s", e)
-            return "Lo siento, ocurrió un error interno al generar la respuesta."
+            return {"response": "Lo siento, ocurrió un error interno al generar la respuesta.", "sources": sources}
