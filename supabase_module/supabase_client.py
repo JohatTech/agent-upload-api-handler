@@ -189,7 +189,7 @@ class SupabaseModule:
                 self.client.storage.get_bucket(bucket_name)
             except Exception:
                 logger.info("Bucket '%s' not found. Creating it...", bucket_name)
-                self.client.storage.create_bucket(bucket_name, {"public": True})
+                self.client.storage.create_bucket(bucket_name, {"name": bucket_name, "public": True})
 
             with open(file_path, "rb") as f:
                 res = self.client.storage.from_(bucket_name).upload(
