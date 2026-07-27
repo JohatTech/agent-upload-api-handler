@@ -1,0 +1,306 @@
+--- c:\Users\johat.abrego\Documents\dev\blob-watcher-report-generator\core\notifier.py
++++ c:\Users\johat.abrego\Documents\dev\agent-upload-api-handler\core\notifier.py
+@@ -189,6 +189,45 @@
+     return True
+ 
+ 
++def notify_chat_responder(
++    project_name: str,
++    vector_store_id: str,
++    natural_project_name: str,
++) -> bool:
++    """
++    HTTP POST callback to the chat-responder service.
++    Registers the newly vectorized project's mapping and vector ID so the responder can answer queries.
++    """
++    responder_url = getattr(config, "CHAT_RESPONDER_URL", None)
++    if not responder_url:
++        logger.warning("CHAT_RESPONDER_URL is not set – skipping chat responder registration.")
++        return False
++
++    endpoint = f"{responder_url.rstrip('/')}/api/register-project"
++    logger.info(
++        "Notifier  │  Registering project on chat responder  →  project='%s'  │  vectorStoreId='%s'",
++        project_name,
++        vector_store_id,
++    )
++
++    try:
++        response = requests.post(
++            endpoint,
++            json={
++                "project_name": project_name,
++                "vector_store_id": vector_store_id,
++                "natural_project_name": natural_project_name,
++            },
++            headers={"Content-Type": "application/json"},
++            timeout=10,
++            verify=False,
++        )
++        response.raise_for_status()
++        logger.info("Notifier  │  ✓  Chat responder registered project successfully.")
++        return True
++    except Exception as exc:
++        logger.error("Notifier  │  ✗  Chat responder registration failed: %s", exc)
++        return False
+ 
+ def get_project_title_from_responder(project_name: str) -> str:
+     """
+
+--- c:\Users\johat.abrego\Documents\dev\blob-watcher-report-generator\core\pipeline.py
++++ c:\Users\johat.abrego\Documents\dev\agent-upload-api-handler\core\pipeline.py
+@@ -13,6 +13,7 @@
+ from pathlib import Path
+ from typing import Any
+ import json
++import re
+ 
+ from langchain_core.documents import Document
+ 
+@@ -21,7 +22,7 @@
+ from core.enrichment import enrich_chunks
+ from core.vectorstore_manager import push_to_all_targets
+ from core.utils import format_bytes, set_collection_name
+-from core.notifier import notify_power_automate, notify_frontend, get_project_title_from_responder
++from core.notifier import notify_power_automate, notify_frontend, notify_chat_responder, get_project_title_from_responder
+ 
+ from agent_module.agent_system import AutonomousRAGAgent
+ from agent_module.report_generator import generate_report
+@@ -57,6 +58,12 @@
+         process_type="folder",
+     )
+     
++    # Extract tag if exists: e.g. "[innovation] MiProyecto" -> tag="innovation"
++    tag = None
++    match = re.match(r'^\[([^\]]+)\]', project_name)
++    if match:
++        tag = match.group(1)
++    
+     parts = project_name.split("_")
+     email = parts[0] if parts else None
+ 
+@@ -70,10 +77,9 @@
+     vector_store_id = set_collection_name(project_name)
+     try:
+         supabase_module = SupabaseModule()
+-        db_project_name = f"[{email}] Nuevo proyecto añadido" if email else "Nuevo proyecto añadido"
+         job_id = supabase_module.create_pipeline_job(
+-            project_name=db_project_name, 
+-            status="processing",
++            project_name="Nuevo proyecto añadido", 
++            status="triggered",
+             vector_store_id=vector_store_id
+         )
+     except Exception as e:
+@@ -92,7 +98,7 @@
+             total_chunks=0,
+             status="processing",
+             file_count=0,
+-            tag=email,
++            tag=tag,
+         )
+     except Exception as exc:
+         logger.error("Failed to pre-register notebook on frontend: %s", exc)
+@@ -160,7 +166,13 @@
+     except Exception as exc:
+         logger.error("Failed to determine project name via responder server: %s", exc)
+ 
++    # Pre-register vector ID and mapping with Chat Responder microservice
+     vector_store_id = set_collection_name(project_name)
++    notify_chat_responder(
++        project_name=project_name,
++        vector_store_id=vector_store_id,
++        natural_project_name=natural_project_name,
++    )
+ 
+     if job_id and supabase_module:
+         supabase_module.update_pipeline_job(job_id, status="responder_notified")
+@@ -173,7 +185,7 @@
+             total_chunks=len(all_chunks),
+             status="processing",
+             file_count=len(files),
+-            tag=email,
++            tag=tag,
+         )
+     except Exception as exc:
+         logger.error("Failed to pre-register notebook on frontend: %s", exc)
+@@ -259,7 +271,7 @@
+         pdf_path=report_path,
+         report_summary=report_summary,
+         file_count=len(files),
+-        tag=email,
++        tag=tag,
+     )
+ 
+     elapsed = time.perf_counter() - start_time
+@@ -283,6 +295,12 @@
+         process_type="blob",
+     )
+     
++    # Extract tag if exists: e.g. "[innovation] MiProyecto" -> tag="innovation"
++    tag = None
++    match = re.match(r'^\[([^\]]+)\]', project_name)
++    if match:
++        tag = match.group(1)
++    
+     parts = project_name.split("_")
+     email = parts[0] if parts else None
+ 
+@@ -294,10 +312,9 @@
+     vector_store_id = set_collection_name(project_name)
+     try:
+         supabase_module = SupabaseModule()
+-        db_project_name = f"[{email}] Nuevo proyecto añadido" if email else "Nuevo proyecto añadido"
+         job_id = supabase_module.create_pipeline_job(
+-            project_name=db_project_name, 
+-            status="processing",
++            project_name="Nuevo proyecto añadido", 
++            status="triggered",
+             vector_store_id=vector_store_id
+         )
+     except Exception as e:
+@@ -316,7 +333,7 @@
+             total_chunks=0,
+             status="processing",
+             file_count=1,
+-            tag=email,
++            tag=tag,
+         )
+     except Exception as exc:
+         logger.error("Failed to pre-register notebook on frontend: %s", exc)
+@@ -345,7 +362,13 @@
+     except Exception as exc:
+         logger.error("Failed to determine project name via responder server: %s", exc)
+ 
++    # Pre-register vector ID and mapping with Chat Responder microservice
+     vector_store_id = set_collection_name(project_name)
++    notify_chat_responder(
++        project_name=project_name,
++        vector_store_id=vector_store_id,
++        natural_project_name=natural_project_name,
++    )
+ 
+     if job_id and supabase_module:
+         supabase_module.update_pipeline_job(job_id, status="responder_notified")
+@@ -358,7 +381,7 @@
+             total_chunks=len(chunks),
+             status="processing",
+             file_count=1,
+-            tag=email,
++            tag=tag,
+         )
+     except Exception as exc:
+         logger.error("Failed to pre-register notebook on frontend: %s", exc)
+@@ -439,7 +462,110 @@
+         pdf_path=report_path,
+         report_summary=report_summary,
+         file_count=1,
+-        tag=email,
++        tag=tag,
+     )
+ 
+     return len(chunks)
++
++def regenerate_report(
++    project_name: str,
++    vector_store_id: str,
++    model_name: str | None = None,
++    notebook_id: str | None = None,
++) -> bool:
++    """
++    Regenerates the RAG report without re-vectorizing.
++    """
++    target_model = model_name or config.DEFAULT_CHAT_MODEL
++    logger.info("=" * 70)
++    logger.info("REGENERATE REPORT START │ project='%s' │ vector_store_id='%s' │ model='%s'", project_name, vector_store_id, target_model)
++    logger.info("=" * 70)
++
++    # Determine natural language project name first from notebooks table
++    natural_project_name = project_name
++    tag = None
++    try:
++        supabase_module = SupabaseModule()
++        res = supabase_module.client.table("notebooks").select("name, tag").eq("vector_store_id", vector_store_id).limit(1).execute()
++        if res.data and len(res.data) > 0:
++            natural_project_name = res.data[0]["name"]
++            tag = res.data[0].get("tag")
++            logger.info("Found natural project name in database for redo: '%s' and tag: '%s'", natural_project_name, tag)
++    except Exception as e:
++        logger.error("Failed to query natural project name for redo: %s", e)
++
++    try:
++        supabase_module = SupabaseModule()
++        job_id = supabase_module.create_pipeline_job(
++            project_name=natural_project_name, 
++            status="generating_report",
++            vector_store_id=vector_store_id,
++            notebook_id=notebook_id,
++        )
++    except Exception as e:
++        logger.error("Failed to init supabase job: %s", e)
++        job_id = None
++        supabase_module = None
++
++    report_generated = False
++    report_sent = False
++    report_path = None
++    report_summary = ""
++    report_md = None
++
++    try:
++        prompts_path = Path("pliego_form.json")
++        prompts = []
++        if prompts_path.exists():
++            with open(prompts_path, "r", encoding="utf-8") as f:
++                prompts_data = json.load(f)
++                prompts = [item for item in prompts_data if isinstance(item, str)]
++        
++        if prompts:
++            agent = AutonomousRAGAgent(project_name, model_name="CLAUDE", job_id=job_id, vector_store_id=vector_store_id)
++            report_md = agent.process_prompts(prompts)
++            if report_md:
++                clean_summary = report_md.strip()
++                for prefix in ["# ", "## ", "### "]:
++                    if clean_summary.startswith(prefix):
++                        clean_summary = clean_summary[len(prefix):]
++                report_summary = clean_summary[:500] + "..." if len(clean_summary) > 500 else clean_summary
++            
++            # Generate PDF report
++            pdf_path = generate_report(project_name, report_md, model_name="CLAUDE")
++            report_generated = bool(pdf_path)
++            report_path = str(pdf_path) if pdf_path else None
++            
++            # Power Automate (extract email from project_name if present)
++            parts = project_name.split("_")
++            email = parts[0] if parts else None
++            if email and pdf_path:
++                report_sent = notify_power_automate(project_name, email, pdf_path)
++        else:
++            logger.warning("No prompts available for RAG analysis.")
++    except Exception as e:
++        logger.error("Agentic RAG/Reporting failed during regeneration for '%s': %s", project_name, e, exc_info=True)
++        if job_id and supabase_module:
++            supabase_module.update_pipeline_job(job_id, status="failed")
++    else:
++        if job_id and supabase_module:
++            supabase_module.update_pipeline_job(
++                job_id,
++                status="completed" if report_generated else "failed",
++                report_summary=report_summary,
++                pdf_path=report_path
++            )
++
++    # Notify frontend of completion
++    notify_frontend(
++        project_name=natural_project_name,
++        vector_store_id=vector_store_id,
++        total_chunks=0,
++        status="ready" if report_generated else "error",
++        pdf_path=report_path,
++        report_summary=report_summary,
++        file_count=0,
++        tag=tag,
++    )
++
++    return report_generated
+

@@ -1,0 +1,38 @@
+--- c:\Users\johat.abrego\Documents\dev\blob-watcher-report-generator\agent_module\agent_system.py
++++ c:\Users\johat.abrego\Documents\dev\agent-upload-api-handler\agent_module\agent_system.py
+@@ -29,11 +29,11 @@
+         raise e
+ 
+ class AutonomousRAGAgent:
+-    def __init__(self, project_name: str, model_name: str | None = None, job_id: str | None = None):
++    def __init__(self, project_name: str, model_name: str | None = None, job_id: str | None = None, vector_store_id: str | None = None):
+         self.project_name = project_name
+         self.model_name = model_name or config.DEFAULT_CHAT_MODEL
+         self.job_id = job_id
+-        self.collection_name = set_collection_name(project_name)
++        self.collection_name = vector_store_id or set_collection_name(project_name)
+         self.embeddings = get_embeddings()
+         
+         # Initialize LLM using the registry
+
+--- c:\Users\johat.abrego\Documents\dev\blob-watcher-report-generator\agent_module\rag_responder.py
++++ c:\Users\johat.abrego\Documents\dev\agent-upload-api-handler\agent_module\rag_responder.py
+@@ -39,7 +39,7 @@
+                 search_query = "objeto de la licitación nombre del proyecto título"
+                 query_embedding = self.embeddings.embed_query(search_query)
+ 
+-                res = vectorstore.client.rpc(
++                res = supabase_module.client.rpc(
+                     vectorstore.query_name,
+                     {
+                         "query_embedding": query_embedding,
+@@ -93,7 +93,7 @@
+             vectorstore = supabase_module.get_vectorstore(collection_name, self.embeddings)
+             query_embedding = self.embeddings.embed_query(question)
+ 
+-            res = vectorstore.client.rpc(
++            res = supabase_module.client.rpc(
+                 vectorstore.query_name,
+                 {
+                     "query_embedding": query_embedding,
+

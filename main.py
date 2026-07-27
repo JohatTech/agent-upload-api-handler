@@ -41,7 +41,8 @@ TEMP_UPLOAD_ROOT.mkdir(exist_ok=True)
 def process_project_folder_and_clean(
     folder_path: Path,
     project_name: str,
-    model_name: Optional[str] = None
+    model_name: Optional[str] = None,
+    user_email: Optional[str] = None
 ):
     """
     Background worker that runs the vectorization and RAG report generation,
@@ -49,7 +50,17 @@ def process_project_folder_and_clean(
     """
     logger.info("Starting background processing for project folder: %s", folder_path)
     try:
-        process_project_folder(folder_path, model_name=model_name)
+        try:
+            supabase_module = SupabaseModule()
+            if folder_path.exists():
+                for file_path in folder_path.iterdir():
+                    if file_path.is_file():
+                        object_name = f"{project_name}/{file_path.name}"
+                        supabase_module.upload_file_to_storage("project_files", str(file_path), object_name)
+        except Exception as e:
+            logger.error("Failed to upload files to Supabase Storage in background: %s", e)
+
+        process_project_folder(folder_path, model_name=model_name, user_email=user_email)
     except Exception as exc:
         logger.exception("Pipeline execution failed for project: %s", project_name)
     finally:
@@ -78,6 +89,7 @@ class GenerateReportRequest(BaseModel):
     project_name: str
     model_name: Optional[str] = None
     notebook_id: Optional[str] = None
+    user_email: Optional[str] = None
 
 # --- Routes ---------------------------------------------------------------------
 @app.get("/api/health")
@@ -95,6 +107,7 @@ async def upload_files(
     background_tasks: BackgroundTasks,
     project_name: str = Form(...),
     model_name: Optional[str] = Form(None),
+    user_email: Optional[str] = Form(None),
     files: List[UploadFile] = File(...),
 ):
     """
@@ -115,7 +128,6 @@ async def upload_files(
     project_dir.mkdir(exist_ok=True)
 
     try:
-        supabase_module = SupabaseModule()
         # Save each uploaded file to the temporary directory
         for upload_file in files:
             file_ext = Path(upload_file.filename).suffix.lower()
@@ -130,9 +142,6 @@ async def upload_files(
                 shutil.copyfileobj(upload_file.file, buffer)
             logger.info("Saved file: %s", dest_path)
             
-            # Upload to Supabase Storage
-            object_name = f"{project_name}/{upload_file.filename}"
-            supabase_module.upload_file_to_storage("project_files", str(dest_path), object_name)
     except HTTPException:
         # Re-raise HTTP exceptions (like unsupported file types)
         if project_dir.exists():
@@ -153,6 +162,7 @@ async def upload_files(
         folder_path=project_dir,
         project_name=project_name,
         model_name=model_name,
+        user_email=user_email,
     )
 
     return {
@@ -217,6 +227,7 @@ async def generate_report_endpoint(
         vector_store_id=payload.vector_store_id,
         model_name=payload.model_name,
         notebook_id=payload.notebook_id,
+        user_email=payload.user_email,
     )
 
     return {

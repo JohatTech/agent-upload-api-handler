@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 import json
+import re
 
 from langchain_core.documents import Document
 
@@ -45,6 +46,7 @@ def process_project_folder(
     folder_path: str | Path,
     model_name: str | None = None,
     event_metadata: dict[str, Any] | None = None,
+    user_email: str | None = None,
 ) -> int:
     folder = Path(folder_path)
     project_name = folder.name
@@ -57,8 +59,14 @@ def process_project_folder(
         process_type="folder",
     )
     
+    # Extract tag if exists: e.g. "[innovation] MiProyecto" -> tag="innovation"
+    tag = None
+    match = re.match(r'^\[([^\]]+)\]', project_name)
+    if match:
+        tag = match.group(1)
+    
     parts = project_name.split("_")
-    email = parts[0] if parts else None
+    email = user_email if user_email else (parts[0] if parts else None)
 
     logger.info("=" * 70)
     logger.info("PIPELINE START  │  project='%s'  │  model='%s'", project_name, target_model)
@@ -91,6 +99,7 @@ def process_project_folder(
             total_chunks=0,
             status="processing",
             file_count=0,
+            tag=tag,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -146,7 +155,7 @@ def process_project_folder(
         return 0
 
     # Push to vector stores (Supabase)
-    push_to_all_targets(all_chunks, project_name)
+    push_to_all_targets(all_chunks, project_name, job_id=job_id)
 
     if job_id and supabase_module:
         supabase_module.update_pipeline_job(job_id, status="vectorization_finished")
@@ -177,6 +186,7 @@ def process_project_folder(
             total_chunks=len(all_chunks),
             status="processing",
             file_count=len(files),
+            tag=tag,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -262,6 +272,7 @@ def process_project_folder(
         pdf_path=report_path,
         report_summary=report_summary,
         file_count=len(files),
+        tag=tag,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -274,6 +285,7 @@ def process_blob_file(
     project_name: str,
     model_name: str | None = None,
     event_metadata: dict[str, Any] | None = None,
+    user_email: str | None = None,
 ) -> int:
     path = Path(file_path)
     target_model = model_name or config.DEFAULT_CHAT_MODEL
@@ -285,8 +297,14 @@ def process_blob_file(
         process_type="blob",
     )
     
+    # Extract tag if exists: e.g. "[innovation] MiProyecto" -> tag="innovation"
+    tag = None
+    match = re.match(r'^\[([^\]]+)\]', project_name)
+    if match:
+        tag = match.group(1)
+    
     parts = project_name.split("_")
-    email = parts[0] if parts else None
+    email = user_email if user_email else (parts[0] if parts else None)
 
     logger.info("=" * 70)
     logger.info("BLOB PIPELINE START  │  project='%s'  │  file='%s'  │  model='%s'", project_name, path.name, target_model)
@@ -317,6 +335,7 @@ def process_blob_file(
             total_chunks=0,
             status="processing",
             file_count=1,
+            tag=tag,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -333,7 +352,7 @@ def process_blob_file(
     enrich_chunks(chunks, project_name=project_name, source_file=path)
 
     # Push to vector stores (Supabase)
-    push_to_all_targets(chunks, project_name)
+    push_to_all_targets(chunks, project_name, job_id=job_id)
 
     if job_id and supabase_module:
         supabase_module.update_pipeline_job(job_id, status="vectorization_finished")
@@ -364,6 +383,7 @@ def process_blob_file(
             total_chunks=len(chunks),
             status="processing",
             file_count=1,
+            tag=tag,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -444,6 +464,7 @@ def process_blob_file(
         pdf_path=report_path,
         report_summary=report_summary,
         file_count=1,
+        tag=tag,
     )
 
     return len(chunks)
@@ -453,6 +474,7 @@ def regenerate_report(
     vector_store_id: str,
     model_name: str | None = None,
     notebook_id: str | None = None,
+    user_email: str | None = None,
 ) -> bool:
     """
     Regenerates the RAG report without re-vectorizing.
@@ -464,12 +486,14 @@ def regenerate_report(
 
     # Determine natural language project name first from notebooks table
     natural_project_name = project_name
+    tag = None
     try:
         supabase_module = SupabaseModule()
-        res = supabase_module.client.table("notebooks").select("name").eq("vector_store_id", vector_store_id).limit(1).execute()
+        res = supabase_module.client.table("notebooks").select("name, tag").eq("vector_store_id", vector_store_id).limit(1).execute()
         if res.data and len(res.data) > 0:
             natural_project_name = res.data[0]["name"]
-            logger.info("Found natural project name in database for redo: '%s'", natural_project_name)
+            tag = res.data[0].get("tag")
+            logger.info("Found natural project name in database for redo: '%s' and tag: '%s'", natural_project_name, tag)
     except Exception as e:
         logger.error("Failed to query natural project name for redo: %s", e)
 
@@ -517,7 +541,7 @@ def regenerate_report(
             
             # Power Automate (extract email from project_name if present)
             parts = project_name.split("_")
-            email = parts[0] if parts else None
+            email = user_email if user_email else (parts[0] if parts else None)
             if email and pdf_path:
                 report_sent = notify_power_automate(project_name, email, pdf_path)
         else:
@@ -544,6 +568,7 @@ def regenerate_report(
         pdf_path=report_path,
         report_summary=report_summary,
         file_count=0,
+        tag=tag,
     )
 
     return report_generated

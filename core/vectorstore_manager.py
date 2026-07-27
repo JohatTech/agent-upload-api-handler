@@ -13,7 +13,7 @@ from core.utils import format_bytes, set_collection_name
 logger = logging.getLogger("vectorstore_manager")
 
 
-def _push_to_supabase(chunks: list[Document], project_name: str) -> None:
+def _push_to_supabase(chunks: list[Document], project_name: str, job_id: str | None = None) -> None:
     """
     Push chunks to Supabase. Uses SupabaseModule.
     """
@@ -30,7 +30,7 @@ def _push_to_supabase(chunks: list[Document], project_name: str) -> None:
     embeddings = get_embeddings()
     supabase_module = SupabaseModule()
     supabase_module.create_collection(collection_name=collection)
-    supabase_module.upsert_documents(collection_name=collection, chunks=chunks, embeddings=embeddings)
+    supabase_module.upsert_documents(collection_name=collection, chunks=chunks, embeddings=embeddings, job_id=job_id)
 
 
 _TARGET_REGISTRY: dict[str, callable] = {
@@ -38,7 +38,7 @@ _TARGET_REGISTRY: dict[str, callable] = {
 }
 
 
-def push_to_all_targets(chunks: list[Document], project_name: str) -> None:
+def push_to_all_targets(chunks: list[Document], project_name: str, job_id: str | None = None) -> None:
     """
     Push chunks to every vector store listed in config.VECTORSTORE_TARGETS.
     """
@@ -53,7 +53,7 @@ def push_to_all_targets(chunks: list[Document], project_name: str) -> None:
             continue
 
         try:
-            push_fn(chunks, project_name)
+            push_fn(chunks, project_name, job_id)
         except Exception as exc:
             logger.error(
                 "Failed to push to '%s' for project '%s': %s",

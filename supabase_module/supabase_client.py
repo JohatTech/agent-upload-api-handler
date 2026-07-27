@@ -144,7 +144,7 @@ class SupabaseModule:
         )
         return store
 
-    def upsert_documents(self, collection_name, chunks, embeddings):
+    def upsert_documents(self, collection_name, chunks, embeddings, job_id=None):
         logger.info("Adding %d documents to Supabase for collection '%s'...", len(chunks), collection_name)
         
         # Inject collection name into metadata of each chunk
@@ -158,9 +158,26 @@ class SupabaseModule:
             query_name="match_documents"
         )
         
-        result = store.add_documents(chunks)
+        batch_size = 20
+        total_chunks = len(chunks)
+        processed = 0
+        all_results = []
+        
+        for i in range(0, total_chunks, batch_size):
+            batch = chunks[i:i+batch_size]
+            result = store.add_documents(batch)
+            if result:
+                all_results.extend(result)
+            processed += len(batch)
+            
+            if job_id:
+                try:
+                    self.update_pipeline_job(job_id, status="vectorizing", total_chunks=total_chunks)
+                except Exception as e:
+                    logger.error("Failed to update vectorization progress in Supabase: %s", e)
+        
         logger.info("Successfully added %d documents to Supabase.", len(chunks))
-        return result
+        return all_results
 
     def create_pipeline_job(self, project_name: str, status: str = "triggered", **kwargs) -> str | None:
         """Create a new job tracking record and return its UUID."""
@@ -189,7 +206,7 @@ class SupabaseModule:
                 self.client.storage.get_bucket(bucket_name)
             except Exception:
                 logger.info("Bucket '%s' not found. Creating it...", bucket_name)
-                self.client.storage.create_bucket(bucket_name, {"name": bucket_name, "public": True})
+                self.client.storage.create_bucket(bucket_name, name=bucket_name, options={"public": True})
 
             with open(file_path, "rb") as f:
                 res = self.client.storage.from_(bucket_name).upload(

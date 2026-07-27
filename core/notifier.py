@@ -106,14 +106,8 @@ def notify_frontend(
     pdf_path: str | Path | None = None,
     report_summary: str | None = None,
     file_count: int = 0,
+    tag: str | None = None,
 ) -> bool:
-    api_url = getattr(config, "FRONTEND_API_URL", None)
-    if not api_url:
-        logger.warning("FRONTEND_API_URL is not set – skipping frontend notification.")
-        return False
-
-    endpoint = f"{api_url.rstrip('/')}/api/notebooks"
-
     pdf_base64 = None
     if pdf_path:
         pdf_file = Path(pdf_path)
@@ -123,42 +117,6 @@ def notify_frontend(
                     pdf_base64 = base64.b64encode(f.read()).decode("utf-8")
             except Exception as e:
                 logger.error("Failed to read PDF for base64 encoding: %s", e)
-
-    logger.info(
-        "Notifier  │  Sending notebook payload to frontend  →  project='%s'  │  vectorStoreId='%s'",
-        project_name,
-        vector_store_id,
-    )
-
-    notebook_id = None
-    try:
-        response = requests.post(
-            endpoint,
-            json={
-                "name": project_name,
-                "vectorStoreId": vector_store_id,
-                "status": status,
-                "fileCount": file_count,
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=15,
-        )
-        response.raise_for_status()
-        
-        # Safely parse response JSON, falling back to response text if not JSON
-        try:
-            if response.text and response.text.strip():
-                notebook_data = response.json()
-                notebook_id = notebook_data.get("id") if isinstance(notebook_data, dict) else None
-            else:
-                notebook_id = "ok"
-        except Exception:
-            notebook_id = response.text.strip()[:50] or "ok"
-
-        logger.info("Notifier  │  ✓  Frontend registered notebook: '%s'  │  project='%s'", notebook_id, project_name)
-    except Exception as exc:
-        logger.error("Notifier  │  ✗  Frontend notebook registration failed for project='%s': %s", project_name, exc)
-        return False
 
     if pdf_base64:
         try:
