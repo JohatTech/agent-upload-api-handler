@@ -107,6 +107,7 @@ def notify_frontend(
     report_summary: str | None = None,
     file_count: int = 0,
     tag: str | None = None,
+    uploaded_files: list[tuple[str, str]] | None = None,
 ) -> bool:
     pdf_base64 = None
     if pdf_path:
@@ -118,28 +119,89 @@ def notify_frontend(
             except Exception as e:
                 logger.error("Failed to read PDF for base64 encoding: %s", e)
 
-    if pdf_base64:
-        try:
-            from supabase_module.supabase_client import SupabaseModule
-            supabase_module = SupabaseModule()
+    try:
+        from supabase_module.supabase_client import SupabaseModule
+        import re
+        supabase_module = SupabaseModule()
+        
+        # Lookup or create the real notebook in Supabase using vector_store_id
+        res = supabase_module.client.table("notebooks").select("id").eq("vector_store_id", vector_store_id).order("created_at", desc=True).limit(1).execute()
+        
+        real_notebook_id = None
+        if res.data and len(res.data) > 0:
+            real_notebook_id = res.data[0]["id"]
+            update_payload = {"status": status, "last_activity": datetime.now(timezone.utc).isoformat()}
+            if file_count > 0:
+                update_payload["file_count"] = file_count
+            if tag:
+                update_payload["tag"] = tag
+            supabase_module.client.table("notebooks").update(update_payload).eq("id", real_notebook_id).execute()
+        else:
+            real_notebook_id = f"nb-{int(datetime.now(timezone.utc).timestamp()*1000)}"
+            clean_name = re.sub(r'^\[[^\]]+\]\s*', '', project_name)
             
-            # Lookup the real notebook_id from Supabase using vector_store_id
-            res = supabase_module.client.table("notebooks").select("id").eq("vector_store_id", vector_store_id).order("created_at", desc=True).limit(1).execute()
-            
-            if res.data and len(res.data) > 0:
-                real_notebook_id = res.data[0]["id"]
-                report_payload = {
-                    "notebook_id": real_notebook_id,
-                    "title": f"Reporte — {project_name}",
-                    "summary": report_summary or f"Análisis de licitación completado para {project_name}.",
-                    "pdf_base64": pdf_base64,
-                }
-                supabase_module.client.table("reports").insert(report_payload).execute()
-                logger.info("Notifier  │  ✓  Report directly inserted to Supabase for notebook %s", real_notebook_id)
-            else:
-                logger.error("Notifier  │  ✗  Could not find notebook with vector_store_id '%s' in database. Cannot insert report.", vector_store_id)
-        except Exception as exc:
-            logger.error("Notifier  │  ✗  Direct Supabase report insertion failed: %s", exc)
+            # Resolve owner_id from profiles
+            resolved_owner_id = None
+            try:
+                profiles_res = supabase_module.client.table("profiles").select("id, email, tag").execute()
+                if profiles_res.data:
+                    vs_prefix = vector_store_id.lower().split("_")[0] if vector_store_id else ""
+                    for p in profiles_res.data:
+                        p_email = (p.get("email") or "").lower()
+                        sanitized_email = re.sub(r'[^a-z0-9]', '', p_email)
+                        if sanitized_email and vs_prefix and sanitized_email == vs_prefix:
+                            resolved_owner_id = p.get("id")
+                            break
+                        if tag and p_email == tag.lower():
+                            resolved_owner_id = p.get("id")
+                            break
+            except Exception as p_err:
+                logger.warning("Failed to resolve owner_id for notebook insert: %s", p_err)
+
+            nb_payload = {
+                "id": real_notebook_id,
+                "name": clean_name or project_name,
+                "project_source": f"blob/{project_name.lower()}",
+                "file_count": file_count,
+                "status": status,
+                "vector_store_id": vector_store_id,
+                "tag": tag,
+            }
+            if resolved_owner_id:
+                nb_payload["owner_id"] = resolved_owner_id
+
+            try:
+                supabase_module.client.table("notebooks").insert(nb_payload).execute()
+            except Exception as nb_err:
+                logger.error("Failed to auto-create notebook in Supabase: %s", nb_err)
+
+        if real_notebook_id and uploaded_files:
+            for file_name, file_url in uploaded_files:
+                try:
+                    supabase_module.client.table("notebook_files").upsert(
+                        {
+                            "notebook_id": real_notebook_id,
+                            "file_name": file_name,
+                            "file_url": file_url,
+                        },
+                        on_conflict="notebook_id,file_name"
+                    ).execute()
+                    logger.info("Notifier  │  ✓  Synced notebook_file '%s' with URL %s", file_name, file_url)
+                except Exception as nf_err:
+                    logger.error("Failed to sync notebook_file '%s': %s", file_name, nf_err)
+
+
+        if pdf_base64 and real_notebook_id:
+            report_payload = {
+                "notebook_id": real_notebook_id,
+                "title": f"Reporte — {project_name}",
+                "summary": report_summary or f"Análisis de licitación completado para {project_name}.",
+                "pdf_base64": pdf_base64,
+            }
+            supabase_module.client.table("reports").insert(report_payload).execute()
+            logger.info("Notifier  │  ✓  Report directly inserted to Supabase for notebook %s", real_notebook_id)
+    except Exception as exc:
+        logger.error("Notifier  │  ✗  Direct Supabase notebook/report sync failed: %s", exc)
 
     return True
 

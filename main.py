@@ -20,14 +20,10 @@ logger = logging.getLogger("api.main")
 # --- FastAPI Initialization ----------------------------------------------------
 app = FastAPI(title="AgentLicitaciones API", version="1.0", redirect_slashes=False)
 
-# Setup CORS with configurations from config.py if present, fallback to "*"
-allowed_origins = getattr(config, "ALLOWED_ORIGINS", ["*"])
-allow_creds = "*" not in allowed_origins
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_creds,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -49,18 +45,21 @@ def process_project_folder_and_clean(
     then cleans up the temporary directory from disk.
     """
     logger.info("Starting background processing for project folder: %s", folder_path)
+    uploaded_files: list[tuple[str, str]] = []
     try:
         try:
-            supabase_module = SupabaseModule()
+            from core.azure_blob_service import AzureBlobService
+            azure_service = AzureBlobService()
             if folder_path.exists():
                 for file_path in folder_path.iterdir():
                     if file_path.is_file():
-                        object_name = f"{project_name}/{file_path.name}"
-                        supabase_module.upload_file_to_storage("project_files", str(file_path), object_name)
+                        blob_name = f"{project_name}/{file_path.name}"
+                        blob_url = azure_service.upload_file(file_path, blob_name)
+                        uploaded_files.append((file_path.name, blob_url))
         except Exception as e:
-            logger.error("Failed to upload files to Supabase Storage in background: %s", e)
+            logger.error("Failed to upload files to Azure Blob Storage in background: %s", e)
 
-        process_project_folder(folder_path, model_name=model_name, user_email=user_email)
+        process_project_folder(folder_path, model_name=model_name, user_email=user_email, uploaded_files=uploaded_files)
     except Exception as exc:
         logger.exception("Pipeline execution failed for project: %s", project_name)
     finally:
@@ -103,6 +102,7 @@ def agent_get():
     return {"status": "AgentLicitaciones API", "version": "1.0"}
 
 @app.post("/api/upload")
+@app.post("/api/upload/")
 async def upload_files(
     background_tasks: BackgroundTasks,
     project_name: str = Form(...),
@@ -174,6 +174,7 @@ async def upload_files(
     }
 
 @app.post("/api/agent")
+@app.post("/api/agent/")
 def handle_agent_event(payload: AgentRequest):
     """
     Chat endpoint for direct interaction with the RAG system.
@@ -207,6 +208,7 @@ def handle_agent_event(payload: AgentRequest):
         )
 
 @app.post("/api/generate-report")
+@app.post("/api/generate-report/")
 async def generate_report_endpoint(
     payload: GenerateReportRequest,
     background_tasks: BackgroundTasks
@@ -236,3 +238,42 @@ async def generate_report_endpoint(
         "project_name": payload.project_name,
         "vector_store_id": payload.vector_store_id
     }
+
+# --- Analytics Request Models & Endpoints ---------------------------------------
+class AnalyticsExtractRequest(BaseModel):
+    notebook_id: str
+
+@app.post("/api/analytics/extract")
+@app.post("/api/analytics/extract/")
+async def extract_analytics_endpoint(payload: AnalyticsExtractRequest):
+    """
+    Independent endpoint to trigger trend analytics extraction for a specific notebook.
+    """
+    logger.info("Trend analytics extraction requested for notebook '%s'", payload.notebook_id)
+    try:
+        from trend_module.service import process_notebook_trend_analytics
+        result = process_notebook_trend_analytics(payload.notebook_id)
+        return result
+    except Exception as exc:
+        logger.exception("Failed to extract trend analytics for notebook '%s'", payload.notebook_id)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Trend analytics extraction failed", "details": str(exc)}
+        )
+
+@app.post("/api/analytics/reprocess")
+@app.post("/api/analytics/reprocess/")
+async def reprocess_all_analytics_endpoint(background_tasks: BackgroundTasks):
+    """
+    Independent endpoint to trigger backfill trend extraction across all unanalyzed project reports.
+    """
+    logger.info("Batch trend analytics reprocess requested.")
+    from trend_module.service import process_all_pending_trends
+    
+    background_tasks.add_task(process_all_pending_trends)
+    
+    return {
+        "status": "accepted",
+        "message": "Batch trend analytics reprocess job started in the background."
+    }
+

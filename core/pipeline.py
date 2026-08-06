@@ -47,6 +47,7 @@ def process_project_folder(
     model_name: str | None = None,
     event_metadata: dict[str, Any] | None = None,
     user_email: str | None = None,
+    uploaded_files: list[tuple[str, str]] | None = None,
 ) -> int:
     folder = Path(folder_path)
     project_name = folder.name
@@ -79,9 +80,10 @@ def process_project_folder(
     try:
         supabase_module = SupabaseModule()
         job_id = supabase_module.create_pipeline_job(
-            project_name="Nuevo proyecto añadido", 
+            project_name=project_name, 
             status="triggered",
-            vector_store_id=vector_store_id
+            vector_store_id=vector_store_id,
+            tag=tag
         )
     except Exception as e:
         logger.error("Failed to init supabase job: %s", e)
@@ -94,12 +96,13 @@ def process_project_folder(
     # Notify frontend that the notebook is processing BEFORE vectorization
     try:
         notify_frontend(
-            project_name="Nuevo proyecto añadido",
+            project_name=project_name,
             vector_store_id=vector_store_id,
             total_chunks=0,
             status="processing",
             file_count=0,
             tag=tag,
+            uploaded_files=uploaded_files,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -315,9 +318,10 @@ def process_blob_file(
     try:
         supabase_module = SupabaseModule()
         job_id = supabase_module.create_pipeline_job(
-            project_name="Nuevo proyecto añadido", 
+            project_name=project_name, 
             status="triggered",
-            vector_store_id=vector_store_id
+            vector_store_id=vector_store_id,
+            tag=tag
         )
     except Exception as e:
         logger.error("Failed to init supabase job: %s", e)
@@ -327,15 +331,27 @@ def process_blob_file(
     if job_id and supabase_module:
         supabase_module.update_pipeline_job(job_id, status="vectorizing")
 
+    # Generate Azure Blob URL for this blob file
+    blob_files = None
+    try:
+        from core.azure_blob_service import AzureBlobService
+        azure_service = AzureBlobService()
+        blob_name = f"{project_name}/{path.name}"
+        blob_url = azure_service.get_blob_url(blob_name)
+        blob_files = [(path.name, blob_url)]
+    except Exception as e:
+        logger.error("Failed to compute Azure Blob URL for '%s': %s", path.name, e)
+
     # Notify frontend that the notebook is processing BEFORE vectorization
     try:
         notify_frontend(
-            project_name="Nuevo proyecto añadido",
+            project_name=project_name,
             vector_store_id=vector_store_id,
             total_chunks=0,
             status="processing",
             file_count=1,
             tag=tag,
+            uploaded_files=blob_files,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
