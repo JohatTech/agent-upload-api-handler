@@ -158,7 +158,7 @@ class SupabaseModule:
             query_name="match_documents"
         )
         
-        batch_size = 20
+        batch_size = getattr(config, "VECTOR_BATCH_SIZE", 128)
         total_chunks = len(chunks)
         processed = 0
         all_results = []
@@ -169,6 +169,7 @@ class SupabaseModule:
             if result:
                 all_results.extend(result)
             processed += len(batch)
+            logger.info("Supabase vector upsert: %d/%d chunks (batch size %d)", processed, total_chunks, len(batch))
             
             if job_id:
                 try:
@@ -176,7 +177,7 @@ class SupabaseModule:
                 except Exception as e:
                     logger.error("Failed to update vectorization progress in Supabase: %s", e)
         
-        logger.info("Successfully added %d documents to Supabase.", len(chunks))
+        logger.info("Successfully added %d documents to Supabase pgvector.", len(chunks))
         return all_results
 
     def create_pipeline_job(self, project_name: str, status: str = "triggered", **kwargs) -> str | None:
@@ -228,4 +229,36 @@ class SupabaseModule:
         except Exception as exc:
             logger.error("Failed to get public URL: %s", exc)
             return ""
+
+    def get_stuck_pipeline_jobs(self) -> List[Dict[str, Any]]:
+        """Fetch pipeline jobs that are in non-terminal/stuck states."""
+        stuck_statuses = [
+            "triggered", "vectorizing", "vectorization_finished",
+            "responder_notified", "generating_report", "processing", "in_progress"
+        ]
+        try:
+            res = self.client.table("pipeline_jobs").select("*").in_("status", stuck_statuses).execute()
+            return res.data or []
+        except Exception as exc:
+            logger.error("Failed to fetch stuck pipeline jobs: %s", exc)
+            return []
+
+    def get_stuck_notebooks(self) -> List[Dict[str, Any]]:
+        """Fetch notebooks that are in non-terminal 'processing' status."""
+        try:
+            res = self.client.table("notebooks").select("*").eq("status", "processing").execute()
+            return res.data or []
+        except Exception as exc:
+            logger.error("Failed to fetch stuck notebooks: %s", exc)
+            return []
+
+    def has_vectors_for_collection(self, vector_store_id: str) -> bool:
+        """Check if any document chunks exist in Supabase for the given vector_store_id."""
+        try:
+            res = self.client.table("documents").select("id").filter("metadata->>collection", "eq", vector_store_id).limit(1).execute()
+            return bool(res.data and len(res.data) > 0)
+        except Exception as exc:
+            logger.error("Failed to check vectors for collection '%s': %s", vector_store_id, exc)
+            return False
+
 

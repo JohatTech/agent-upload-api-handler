@@ -9,8 +9,20 @@ from pydantic import BaseModel
 
 import config
 from agent_module.rag_responder import RAGResponder
-from core.pipeline import process_project_folder, regenerate_report
-from core.utils import set_collection_name
+from core.azure_blob_service import AzureBlobService
+from core.formatting import sanitize_collection_name, set_collection_name
+from core.pipeline import (
+    process_project_cloud_ingestion,
+    process_project_folder,
+    regenerate_report,
+)
+from core.recovery_service import start_recovery_in_background
+from core.schemas import (
+    IngestProjectRequest,
+    IngestProjectResponse,
+    PresignUploadRequest,
+    PresignUploadResponse,
+)
 from supabase_module.supabase_client import SupabaseModule
 
 # --- Logging --------------------------------------------------------------------
@@ -19,6 +31,11 @@ logger = logging.getLogger("api.main")
 
 # --- FastAPI Initialization ----------------------------------------------------
 app = FastAPI(title="AgentLicitaciones API", version="1.0", redirect_slashes=False)
+
+@app.on_event("startup")
+def on_startup():
+    logger.info("FastAPI service starting up. Spawning background recovery scanner...")
+    start_recovery_in_background()
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +49,7 @@ TEMP_UPLOAD_ROOT = Path("temp_uploads")
 
 # Ensure temporary upload directory exists
 TEMP_UPLOAD_ROOT.mkdir(exist_ok=True)
+
 
 # --- Background Task Wrapper ---------------------------------------------------
 def process_project_folder_and_clean(
@@ -91,15 +109,119 @@ class GenerateReportRequest(BaseModel):
     user_email: Optional[str] = None
 
 # --- Routes ---------------------------------------------------------------------
+@app.get("/api/ping")
+def ping():
+    """Ultra-fast, zero-overhead keep-alive ping to prevent Render cold starts."""
+    return {"status": "pong"}
+
 @app.get("/api/health")
 def health():
-    """Simple health-check endpoint."""
-    return {"status": "ok"}
+    """Health-check endpoint validating API status and Supabase DB connection."""
+    import datetime
+    logger.info("Health check ping received at /api/health")
+    
+    supabase_status = "healthy"
+    supabase_error = None
+    
+    try:
+        sb = SupabaseModule()
+        # Perform a fast select query to verify database connectivity
+        sb.client.table("pipeline_jobs").select("id").limit(1).execute()
+        logger.info("Supabase DB connectivity verified successfully.")
+    except Exception as exc:
+        supabase_status = "unhealthy"
+        supabase_error = str(exc)
+        logger.error("Health check failed for Supabase: %s", exc)
+
+    overall_status = "ok" if supabase_status == "healthy" else "degraded"
+
+    return {
+        "status": overall_status,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "services": {
+            "api": {
+                "status": "healthy",
+                "version": "1.0"
+            },
+            "supabase": {
+                "status": supabase_status,
+                "error": supabase_error
+            }
+        }
+    }
 
 @app.get("/api/agent")
 def agent_get():
     """Metadata/status endpoint for GET requests."""
     return {"status": "AgentLicitaciones API", "version": "1.0"}
+
+
+@app.post("/api/upload/presign", response_model=PresignUploadResponse)
+@app.post("/api/upload/presign/", response_model=PresignUploadResponse)
+def presign_upload_urls(payload: PresignUploadRequest) -> PresignUploadResponse:
+    """
+    Generates pre-signed Azure Blob Storage SAS URLs for direct client-to-cloud upload.
+    Completely bypasses Vercel 4.5MB limits and Render web server RAM/timeout limits.
+    """
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="No files specified in presign request.")
+
+    # Validate file extensions
+    for item in payload.files:
+        ext = Path(item.file_name).suffix.lower()
+        if ext not in config.SUPPORTED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file format '{ext}' for file '{item.file_name}'. Supported: {list(config.SUPPORTED_EXTENSIONS.keys())}"
+            )
+
+    try:
+        azure_service = AzureBlobService()
+        return azure_service.generate_project_presigned_urls(
+            project_name=payload.project_name,
+            files=payload.files,
+        )
+    except Exception as exc:
+        logger.exception("Error generating presigned SAS URLs")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate upload authorizations: {str(exc)}"
+        )
+
+
+@app.post("/api/ingest", response_model=IngestProjectResponse)
+@app.post("/api/ingest/", response_model=IngestProjectResponse)
+def trigger_cloud_ingestion(
+    payload: IngestProjectRequest,
+    background_tasks: BackgroundTasks,
+) -> IngestProjectResponse:
+    """
+    Triggers the background ingestion & vectorization pipeline for files already uploaded to Azure Blob Storage.
+    Consumes minimal request memory and processes documents via streaming workers.
+    """
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="No files provided for ingestion.")
+
+    logger.info("Received cloud ingestion trigger for project '%s' (%d files)", payload.project_name, len(payload.files))
+
+    vector_store_id = sanitize_collection_name(payload.project_name)
+
+    background_tasks.add_task(
+        process_project_cloud_ingestion,
+        project_name=payload.project_name,
+        files=payload.files,
+        model_name=payload.model_name,
+        user_email=payload.user_email,
+    )
+
+    return IngestProjectResponse(
+        status="accepted",
+        message="Cloud files ingestion pipeline triggered successfully in the background.",
+        project_name=payload.project_name,
+        vector_store_id=vector_store_id,
+        files_count=len(payload.files),
+    )
+
 
 @app.post("/api/upload")
 @app.post("/api/upload/")

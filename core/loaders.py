@@ -1,9 +1,11 @@
 """
-Responsible for two things:
-  1. Discovering every supported file inside a project folder.
-  2. Loading & chunking each file with the right LangChain loader.
+Responsible for:
+  1. Discovering supported files inside a project folder.
+  2. Loading & chunking each file using high-performance C-accelerated domain parsers.
+Follows AI/ML Software Engineering Standard (Rule 26: Data Loading, Rule 33: Memory Management).
 """
 
+import gc
 import logging
 from pathlib import Path
 from typing import Optional
@@ -11,24 +13,21 @@ import time
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-)
+from langchain_community.document_loaders import TextLoader
 
 import config
-from core.utils import format_bytes, LightweightDocxLoader, LightweightExcelLoader
+from core.formatting import format_bytes
+from core.parsers import PyMuPDFParser, LightweightDocxLoader, LightweightExcelLoader
 
 logger = logging.getLogger("loaders")
 
 
 _LOADER_FACTORY = {
-    "pdf":  lambda path: PyPDFLoader(path),
+    "pdf":  lambda path: PyMuPDFParser(path),
     "docx": lambda path: LightweightDocxLoader(path),
     "xlsx": lambda path: LightweightExcelLoader(path),
     "txt":  lambda path: TextLoader(path, encoding="utf-8"),
 }
-
 
 
 def check_files_present(folder_path: str | Path, max_retries: int = 5, retry_delay: float = 1.0) -> bool:
@@ -112,6 +111,7 @@ def load_and_chunk_file(
         logger.error("Loader key '%s' has no factory – this is a bug.", loader_key)
         return []
 
+    raw_documents: list[Document] = []
     try:
         loader = factory(str(file_path))
         raw_documents = loader.load()
@@ -126,13 +126,18 @@ def load_and_chunk_file(
     )
 
     chunks = splitter.split_documents(raw_documents)
-    content_size = sum(len(chunk.page_content.encode('utf-8')) for chunk in chunks)
+    content_size = sum(len(chunk.page_content.encode("utf-8")) for chunk in chunks)
     
-    logger.debug(
-        "Loaded & chunked '%s' → %d raw docs → %d chunks  │  content_size=%s",
+    logger.info(
+        "Loaded & chunked '%s' → %d raw pages/sections → %d chunks  │  content_size=%s",
         file_path.name,
         len(raw_documents),
         len(chunks),
         format_bytes(content_size) if chunks else "0 B"
     )
+    
+    # Explicit garbage cleanup
+    del raw_documents
+    gc.collect()
+    
     return chunks

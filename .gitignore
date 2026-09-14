@@ -127,3 +127,4 @@ cython_debug/
 
 # App specific
 temp_uploads/
+reports/

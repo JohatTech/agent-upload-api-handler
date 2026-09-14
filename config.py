@@ -115,7 +115,8 @@ VECTORSTORE_TARGETS: list[str] = [
 ]
 
 # ── Processing ────────────────────────────────────────────────────────────────
-MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "4"))
+MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "1"))
+VECTOR_BATCH_SIZE: int = int(os.getenv("VECTOR_BATCH_SIZE", "128"))
 STABILITY_WAIT_SECONDS: int = int(os.getenv("STABILITY_WAIT_SECONDS", "10"))
 USE_POLLING_WATCHER: bool = os.getenv("USE_POLLING_WATCHER", "False").lower() in ("true", "1", "yes")
 POLLING_INTERVAL_SECONDS: float = float(os.getenv("POLLING_INTERVAL_SECONDS", "10.0"))
