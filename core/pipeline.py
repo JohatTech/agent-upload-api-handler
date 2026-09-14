@@ -113,6 +113,7 @@ def process_project_folder(
             file_count=0,
             tag=tag,
             uploaded_files=uploaded_files,
+            notebook_id=job_id,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -200,6 +201,7 @@ def process_project_folder(
             status="processing",
             file_count=len(files),
             tag=tag,
+            notebook_id=job_id,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -286,6 +288,7 @@ def process_project_folder(
         report_summary=report_summary,
         file_count=len(files),
         tag=tag,
+        notebook_id=job_id,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -356,6 +359,7 @@ def process_project_cloud_ingestion(
             file_count=len(files),
             tag=tag,
             uploaded_files=uploaded_files_summary,
+            notebook_id=job_id,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -518,6 +522,7 @@ def process_project_cloud_ingestion(
         report_summary=report_summary,
         file_count=len(files),
         tag=tag,
+        notebook_id=job_id,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -594,6 +599,7 @@ def process_blob_file(
             file_count=1,
             tag=tag,
             uploaded_files=blob_files,
+            notebook_id=job_id,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -642,6 +648,7 @@ def process_blob_file(
             status="processing",
             file_count=1,
             tag=tag,
+            notebook_id=job_id,
         )
     except Exception as exc:
         logger.error("Failed to pre-register notebook on frontend: %s", exc)
@@ -723,6 +730,7 @@ def process_blob_file(
         report_summary=report_summary,
         file_count=1,
         tag=tag,
+        notebook_id=job_id,
     )
 
     return len(chunks)
@@ -827,6 +835,7 @@ def regenerate_report(
         report_summary=report_summary,
         file_count=0,
         tag=tag,
+        notebook_id=notebook_id or job_id,
     )
 
     return report_generated
