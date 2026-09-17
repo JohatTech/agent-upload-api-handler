@@ -22,7 +22,7 @@ from langchain_core.documents import Document
 import config
 from core.azure_blob_service import AzureBlobService
 from core.enrichment import enrich_chunks
-from core.formatting import format_bytes, sanitize_collection_name
+from core.formatting import format_bytes, sanitize_collection_name, generate_unique_vector_store_id
 from core.loaders import discover_files, load_and_chunk_file
 from core.notifier import (
     get_project_title_from_responder,
@@ -58,6 +58,7 @@ def process_project_folder(
     event_metadata: dict[str, Any] | None = None,
     user_email: str | None = None,
     uploaded_files: list[tuple[str, str]] | None = None,
+    vector_store_id: str | None = None,
 ) -> int:
     folder = Path(folder_path)
     project_name = folder.name
@@ -86,7 +87,8 @@ def process_project_folder(
     start_time = time.perf_counter()
 
     # Step 1: Connect to Supabase and register the START of everything immediately in pipeline_jobs
-    vector_store_id = set_collection_name(project_name)
+    vector_store_id = vector_store_id or generate_unique_vector_store_id(project_name)
+
     try:
         supabase_module = SupabaseModule()
         job_id = supabase_module.create_pipeline_job(
@@ -102,6 +104,37 @@ def process_project_folder(
 
     if job_id and supabase_module:
         supabase_module.update_pipeline_job(job_id, status="vectorizing")
+
+    # Idempotency Guard 1: Check if report already exists in Supabase
+    if supabase_module and supabase_module.has_report(notebook_id=job_id, vector_store_id=vector_store_id):
+        logger.info("PIPELINE [IDEMPOTENT] │ Report already exists for '%s'. Marking completed.", vector_store_id)
+        if job_id:
+            supabase_module.update_pipeline_job(job_id, status="completed")
+        notify_frontend(
+            project_name=project_name,
+            vector_store_id=vector_store_id,
+            total_chunks=0,
+            status="ready",
+            file_count=0,
+            tag=tag,
+            uploaded_files=uploaded_files,
+            notebook_id=job_id,
+        )
+        return 0
+
+    # Idempotency Guard 2: Check if vectors already exist in documents table
+    if supabase_module and supabase_module.has_vectors_for_collection(vector_store_id):
+        logger.info("PIPELINE [IDEMPOTENT] │ Vectors already exist for '%s'. Skipping ingestion and regenerating report.", vector_store_id)
+        if job_id:
+            supabase_module.update_pipeline_job(job_id, status="vectorization_finished")
+        regenerate_report(
+            project_name=project_name,
+            vector_store_id=vector_store_id,
+            model_name=target_model,
+            notebook_id=job_id,
+            user_email=email,
+        )
+        return 0
 
     # Notify frontend that the notebook is processing BEFORE vectorization
     try:
@@ -301,6 +334,7 @@ def process_project_cloud_ingestion(
     files: list[IngestFileItem] | list[dict],
     model_name: str | None = None,
     user_email: str | None = None,
+    vector_store_id: str | None = None,
 ) -> int:
     """
     Direct Cloud Storage Ingestion Pipeline.
@@ -324,7 +358,8 @@ def process_project_cloud_ingestion(
     logger.info("=" * 70)
 
     start_time = time.perf_counter()
-    vector_store_id = set_collection_name(project_name)
+    vector_store_id = vector_store_id or generate_unique_vector_store_id(project_name)
+
 
     # Step 1: Connect to Supabase and register pipeline job
     try:
@@ -342,6 +377,37 @@ def process_project_cloud_ingestion(
 
     if job_id and supabase_module:
         supabase_module.update_pipeline_job(job_id, status="vectorizing")
+
+    # Idempotency Guard 1: Check if report already exists in Supabase
+    if supabase_module and supabase_module.has_report(notebook_id=job_id, vector_store_id=vector_store_id):
+        logger.info("CLOUD INGESTION [IDEMPOTENT] │ Report already exists for '%s'. Marking completed.", vector_store_id)
+        if job_id:
+            supabase_module.update_pipeline_job(job_id, status="completed")
+        notify_frontend(
+            project_name=project_name,
+            vector_store_id=vector_store_id,
+            total_chunks=0,
+            status="ready",
+            file_count=len(files),
+            tag=tag,
+            uploaded_files=uploaded_files_summary,
+            notebook_id=job_id,
+        )
+        return 0
+
+    # Idempotency Guard 2: Check if vectors already exist in documents table
+    if supabase_module and supabase_module.has_vectors_for_collection(vector_store_id):
+        logger.info("CLOUD INGESTION [IDEMPOTENT] │ Vectors already exist for '%s'. Skipping ingestion and regenerating report.", vector_store_id)
+        if job_id:
+            supabase_module.update_pipeline_job(job_id, status="vectorization_finished")
+        regenerate_report(
+            project_name=project_name,
+            vector_store_id=vector_store_id,
+            model_name=target_model,
+            notebook_id=job_id,
+            user_email=email,
+        )
+        return 0
 
     # Notify frontend of initial processing state
     uploaded_files_summary = []

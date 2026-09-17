@@ -19,6 +19,7 @@ class FilePresignRequestItem(BaseModel):
 class PresignUploadRequest(BaseModel):
     """Request to generate pre-signed SAS upload URLs for a batch of files."""
     project_name: str = Field(..., min_length=1, description="Name of the project/notebook")
+    vector_store_id: Optional[str] = Field(None, description="Optional custom or pre-allocated unique vector store ID")
     files: List[FilePresignRequestItem] = Field(..., min_items=1, description="List of files to prepare for upload")
 
 
@@ -50,9 +51,11 @@ class IngestFileItem(BaseModel):
 class IngestProjectRequest(BaseModel):
     """Request to trigger backend processing & vectorization of uploaded cloud files."""
     project_name: str = Field(..., min_length=1, description="Name of the project")
+    vector_store_id: Optional[str] = Field(None, description="Unique vector store ID generated during presign step")
     files: List[IngestFileItem] = Field(..., min_items=1, description="Files already uploaded to cloud storage")
     model_name: Optional[str] = Field(None, description="Target LLM model name")
     user_email: Optional[str] = Field(None, description="User email for notification and sector tagging")
+
 
 
 class IngestProjectResponse(BaseModel):
@@ -62,3 +65,24 @@ class IngestProjectResponse(BaseModel):
     project_name: str
     vector_store_id: str
     files_count: int
+
+
+# ── Pipeline Manual Retry Contracts ──────────────────────────────────────────
+
+class RetryPipelineRequest(BaseModel):
+    """User-triggered request to restart or retry a failed/interrupted pipeline job."""
+    notebook_id: Optional[str] = Field(None, description="UUID or ID of the notebook")
+    vector_store_id: Optional[str] = Field(None, description="Vector store collection ID")
+    project_name: Optional[str] = Field(None, description="Display or folder name of the project")
+    model_name: Optional[str] = Field(None, description="Target LLM model name")
+    user_email: Optional[str] = Field(None, description="User email for notification and sector tagging")
+
+
+class RetryPipelineResponse(BaseModel):
+    """Response confirming that a pipeline job retry has been initiated."""
+    status: str = "accepted"
+    message: str
+    notebook_id: Optional[str] = None
+    vector_store_id: Optional[str] = None
+    project_name: Optional[str] = None
+

@@ -13,12 +13,13 @@ from azure.storage.blob import (
     BlobServiceClient,
     ContainerClient,
     BlobSasPermissions,
+    CorsRule,
     generate_blob_sas,
 )
 
 import config
 from core.exceptions import StorageError, StorageAuthenticationError
-from core.formatting import sanitize_collection_name
+from core.formatting import sanitize_collection_name, generate_unique_vector_store_id
 from core.schemas import (
     FilePresignRequestItem,
     FilePresignResponseItem,
@@ -58,6 +59,38 @@ class AzureBlobService:
         except Exception as exc:
             logger.warning("Could not auto-create container '%s': %s", self.container_name, exc)
 
+    def _ensure_cors_configured(self) -> None:
+        """
+        Ensures CORS rules exist on the Azure Blob Storage account to allow
+        direct browser uploads via XMLHttpRequest/Fetch PUT and preflight OPTIONS.
+        """
+        try:
+            props = self.service_client.get_service_properties()
+            cors_rules = props.get("cors", [])
+            has_valid_rule = False
+            for rule in cors_rules:
+                origins = [o.strip() for o in getattr(rule, "allowed_origins", "").split(",") if o.strip()]
+                methods = [m.strip() for m in getattr(rule, "allowed_methods", "").split(",") if m.strip()]
+                if ("*" in origins or "http://localhost:3000" in origins) and "PUT" in methods and "OPTIONS" in methods:
+                    has_valid_rule = True
+                    break
+
+            if not has_valid_rule:
+                logger.info("Configuring required CORS rules on Azure Blob Storage (%s)...", self.account_name)
+                default_cors_rule = CorsRule(
+                    allowed_origins=["*"],
+                    allowed_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "MERGE"],
+                    allowed_headers=["*"],
+                    exposed_headers=["*"],
+                    max_age_in_seconds=3600,
+                )
+                existing = list(cors_rules) if cors_rules else []
+                existing.append(default_cors_rule)
+                self.service_client.set_service_properties(cors=existing)
+                logger.info("Successfully provisioned CORS rules on Azure Blob service.")
+        except Exception as exc:
+            logger.warning("Could not auto-configure CORS rules on Azure Storage: %s", exc)
+
     def get_blob_url(self, blob_name: str) -> str:
         """Returns the canonical public HTTPS URL for a blob in Azure Blob Storage."""
         quoted_blob_name = quote(blob_name, safe="/")
@@ -95,19 +128,21 @@ class AzureBlobService:
         self,
         project_name: str,
         files: list[FilePresignRequestItem],
+        vector_store_id: str | None = None,
         expiry_minutes: int = 60
     ) -> PresignUploadResponse:
         """
-        Generates a batch of SAS upload URLs for all files in a project.
+        Generates a batch of SAS upload URLs for all files in a project using a guaranteed unique vector store ID and storage folder.
         """
         self._ensure_container_exists()
-        vector_store_id = sanitize_collection_name(project_name)
+        self._ensure_cors_configured()
+        final_vector_store_id = vector_store_id or generate_unique_vector_store_id(project_name)
         response_items: list[FilePresignResponseItem] = []
 
         for item in files:
             # Sanitize file name to avoid path traversal
             safe_filename = Path(item.file_name).name
-            blob_name = f"{project_name}/{safe_filename}"
+            blob_name = f"{final_vector_store_id}/{safe_filename}"
             upload_sas_url = self.generate_upload_sas_url(blob_name, expiry_minutes=expiry_minutes)
             blob_url = self.get_blob_url(blob_name)
 
@@ -122,12 +157,12 @@ class AzureBlobService:
 
         logger.info(
             "Generated %d SAS upload URLs for project '%s' (vector_store_id: %s)",
-            len(response_items), project_name, vector_store_id
+            len(response_items), project_name, final_vector_store_id
         )
 
         return PresignUploadResponse(
             project_name=project_name,
-            vector_store_id=vector_store_id,
+            vector_store_id=final_vector_store_id,
             files=response_items,
         )
 

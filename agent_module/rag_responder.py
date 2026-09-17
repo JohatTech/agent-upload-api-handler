@@ -19,7 +19,7 @@ class RAGResponder:
         self.llm = get_llm(self.model_name)
         self.embeddings = get_embeddings()
 
-    def get_project_title(self, project_name: str, chunks: List[Document] = None) -> str:
+    def get_project_title(self, project_name: str, chunks: List[Document] = None, vector_store_id: str | None = None) -> str:
         """
         Identify the natural language project title of the tender.
         If chunks are provided, uses the first few chunks to extract the title.
@@ -31,8 +31,8 @@ class RAGResponder:
             selected_chunks = chunks[:3]
             text_content = "\n\n".join([c.page_content for c in selected_chunks])
         else:
-            logger.info("RAGResponder  │  Naming project '%s' by querying Supabase", project_name)
-            collection_name = set_collection_name(project_name)
+            collection_name = vector_store_id or set_collection_name(project_name)
+            logger.info("RAGResponder  │  Naming project '%s' by querying Supabase collection '%s'", project_name, collection_name)
             try:
                 supabase_module = SupabaseModule()
                 vectorstore = supabase_module.get_vectorstore(collection_name, self.embeddings)
@@ -82,12 +82,15 @@ class RAGResponder:
             logger.error("RAGResponder  │  Failed to generate project title via LLM: %s", e)
             return project_name
 
-    def respond_chat(self, project_name: str, question: str) -> str:
+    def respond_chat(self, project_name: str | None = None, question: str = "", vector_store_id: str | None = None) -> dict[str, Any]:
         """
         Perform a RAG search on the project's vector store and answer the question.
+        Returns a dictionary containing 'response' and 'sources'.
         """
-        logger.info("RAGResponder  │  Responding to chat question for project '%s': '%s'", project_name, question)
-        collection_name = set_collection_name(project_name)
+        collection_name = vector_store_id or set_collection_name(project_name or "default_collection")
+        logger.info("RAGResponder  │  Responding to chat for collection '%s' (project: '%s'): '%s'", collection_name, project_name, question)
+        sources: list[dict[str, Any]] = []
+        
         try:
             supabase_module = SupabaseModule()
             vectorstore = supabase_module.get_vectorstore(collection_name, self.embeddings)
@@ -102,16 +105,26 @@ class RAGResponder:
                 }
             ).execute()
 
-            context = "\n\n".join([f"Documento {i+1}:\n{item.get('content', '')}" for i, item in enumerate(res.data)])
+            if res.data:
+                for item in res.data:
+                    sources.append({
+                        "page_content": item.get("content", ""),
+                        "metadata": item.get("metadata", {})
+                    })
+
+            context = "\n\n".join([f"Documento {i+1}:\n{item.get('content', '')}" for i, item in enumerate(res.data or [])])
         except Exception as e:
             logger.exception("RAGResponder  │  Failed to query Supabase for chat message")
-            return "Lo siento, hubo un error al consultar la base de datos del proyecto."
+            return {
+                "response": "Lo siento, hubo un error al consultar la base de datos del proyecto.",
+                "sources": []
+            }
 
         prompt = ChatPromptTemplate.from_messages([
             ("system",
              "Eres un asistente inteligente especializado en responder preguntas sobre pliegos de condiciones de licitaciones.\n"
              "Responde la pregunta del usuario utilizando ÚNICAMENTE la información provista en el contexto.\n"
-             "Si la respuesta no se encuentra en el contexto, indícalo de manera de forma educada.\n"
+             "Si la respuesta no se encuentra en el contexto, indícalo de manera educada.\n"
              "Reglas:\n"
              "- Responde de manera clara, concisa y profesional.\n"
              "- Responde en español.\n"
@@ -123,7 +136,14 @@ class RAGResponder:
         try:
             chain = prompt | self.llm
             response = chain.invoke({"context": context, "question": question})
-            return response.content.strip()
+            return {
+                "response": response.content.strip(),
+                "sources": sources
+            }
         except Exception as e:
             logger.error("RAGResponder  │  Failed to generate chat response: %s", e)
-            return "Lo siento, ocurrió un error interno al generar la respuesta."
+            return {
+                "response": "Lo siento, ocurrió un error interno al generar la respuesta.",
+                "sources": sources
+            }
+

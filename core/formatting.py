@@ -34,5 +34,22 @@ def sanitize_collection_name(name: str) -> str:
     return cleaned or "default_collection"
 
 
+def generate_unique_vector_store_id(project_name: str, user_email: str | None = None) -> str:
+    """
+    Generates a guaranteed unique vector store ID incorporating the base project name,
+    a UTC timestamp, and a short random hex token to prevent database collisions.
+    Example: 'innovation_miproyecto_20260917_162500_a3f8'
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    base = sanitize_collection_name(project_name)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    short_hash = uuid.uuid4().hex[:4]
+    
+    return f"{base}_{timestamp}_{short_hash}"
+
+
 # Alias for backward compatibility
 set_collection_name = sanitize_collection_name
+

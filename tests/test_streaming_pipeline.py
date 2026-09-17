@@ -14,7 +14,7 @@ import pymupdf as fitz
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config
-from core.formatting import format_bytes, sanitize_collection_name
+from core.formatting import format_bytes, sanitize_collection_name, generate_unique_vector_store_id
 from core.parsers.pdf_parser import PyMuPDFParser
 from core.parsers.docx_parser import LightweightDocxLoader
 from core.schemas import (
@@ -42,6 +42,15 @@ def test_sanitize_collection_name():
     assert sanitize_collection_name("Mi Proyecto 2026") == "mi_proyecto_2026"
     assert sanitize_collection_name("[innovation] Licitación Hospital") == "innovation_licitacion_hospital"
     assert sanitize_collection_name("Special---Characters & Symbols!!") == "special_characters_symbols"
+
+
+def test_generate_unique_vector_store_id():
+    """Verify that generate_unique_vector_store_id produces unique identifiers for the same project name."""
+    id1 = generate_unique_vector_store_id("MiProyecto")
+    id2 = generate_unique_vector_store_id("MiProyecto")
+    assert id1.startswith("miproyecto_")
+    assert id2.startswith("miproyecto_")
+    assert id1 != id2
 
 
 def test_pymupdf_parser_streaming():
@@ -111,8 +120,10 @@ def test_presign_request_schema_validation():
 
 if __name__ == "__main__":
     test_sanitize_collection_name()
+    test_generate_unique_vector_store_id()
     test_pymupdf_parser_streaming()
     test_pdf_split_by_half()
     test_azure_sas_generation()
     test_presign_request_schema_validation()
     print("All backend tests PASSED successfully!")
+

@@ -10,18 +10,23 @@ from pydantic import BaseModel
 import config
 from agent_module.rag_responder import RAGResponder
 from core.azure_blob_service import AzureBlobService
-from core.formatting import sanitize_collection_name, set_collection_name
+from core.formatting import sanitize_collection_name, set_collection_name, generate_unique_vector_store_id
 from core.pipeline import (
     process_project_cloud_ingestion,
     process_project_folder,
     regenerate_report,
 )
-from core.recovery_service import start_recovery_in_background
+from core.recovery_service import (
+    mark_crashed_jobs_on_startup,
+    retry_single_project_pipeline,
+)
 from core.schemas import (
     IngestProjectRequest,
     IngestProjectResponse,
     PresignUploadRequest,
     PresignUploadResponse,
+    RetryPipelineRequest,
+    RetryPipelineResponse,
 )
 from supabase_module.supabase_client import SupabaseModule
 
@@ -34,8 +39,8 @@ app = FastAPI(title="AgentLicitaciones API", version="1.0", redirect_slashes=Fal
 
 @app.on_event("startup")
 def on_startup():
-    logger.info("FastAPI service starting up. Spawning background recovery scanner...")
-    start_recovery_in_background()
+    logger.info("FastAPI service starting up. Checking for jobs interrupted by crash/restart...")
+    mark_crashed_jobs_on_startup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -180,6 +185,7 @@ def presign_upload_urls(payload: PresignUploadRequest) -> PresignUploadResponse:
         return azure_service.generate_project_presigned_urls(
             project_name=payload.project_name,
             files=payload.files,
+            vector_store_id=payload.vector_store_id,
         )
     except Exception as exc:
         logger.exception("Error generating presigned SAS URLs")
@@ -202,9 +208,12 @@ def trigger_cloud_ingestion(
     if not payload.files:
         raise HTTPException(status_code=400, detail="No files provided for ingestion.")
 
-    logger.info("Received cloud ingestion trigger for project '%s' (%d files)", payload.project_name, len(payload.files))
+    vector_store_id = payload.vector_store_id or generate_unique_vector_store_id(payload.project_name)
 
-    vector_store_id = sanitize_collection_name(payload.project_name)
+    logger.info(
+        "Received cloud ingestion trigger for project '%s' (vector_store_id: %s, %d files)",
+        payload.project_name, vector_store_id, len(payload.files)
+    )
 
     background_tasks.add_task(
         process_project_cloud_ingestion,
@@ -212,6 +221,7 @@ def trigger_cloud_ingestion(
         files=payload.files,
         model_name=payload.model_name,
         user_email=payload.user_email,
+        vector_store_id=vector_store_id,
     )
 
     return IngestProjectResponse(
@@ -221,6 +231,7 @@ def trigger_cloud_ingestion(
         vector_store_id=vector_store_id,
         files_count=len(payload.files),
     )
+
 
 
 @app.post("/api/upload")
@@ -305,17 +316,21 @@ def handle_agent_event(payload: AgentRequest):
     model_name = payload.model_name
 
     if event_type == "chat":
-        project_name = payload.project_name or payload.vector_store_id or payload.notebook_id
+        vector_store_id = payload.vector_store_id or payload.notebook_id or payload.project_name
         question = payload.question or payload.message
-        if not project_name or not question:
+        if not vector_store_id or not question:
             raise HTTPException(
                 status_code=400,
-                detail="Missing required fields: project_name (or vector_store_id/notebook_id) and question (or message)."
+                detail="Missing required fields: vector_store_id (or project_name/notebook_id) and question (or message)."
             )
         try:
-            logger.info("RAG Query received for project '%s': %s", project_name, question)
+            logger.info("RAG Query received for vector_store_id '%s': %s", vector_store_id, question)
             responder = RAGResponder(model_name=model_name)
-            answer_data = responder.respond_chat(project_name, question)
+            answer_data = responder.respond_chat(
+                project_name=payload.project_name,
+                question=question,
+                vector_store_id=vector_store_id,
+            )
             return answer_data
         except Exception as exc:
             logger.exception("Chat responder failed")
@@ -360,6 +375,40 @@ async def generate_report_endpoint(
         "project_name": payload.project_name,
         "vector_store_id": payload.vector_store_id
     }
+
+@app.post("/api/pipeline/retry", response_model=RetryPipelineResponse)
+@app.post("/api/pipeline/retry/", response_model=RetryPipelineResponse)
+async def retry_pipeline_endpoint(
+    payload: RetryPipelineRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Explicit user-triggered retry endpoint for a failed or interrupted pipeline job.
+    Checks if vectors exist to resume report generation or re-downloads project files from Azure.
+    """
+    logger.info(
+        "Manual pipeline retry requested for project '%s' (vector_store_id: '%s', notebook_id: '%s')",
+        payload.project_name,
+        payload.vector_store_id,
+        payload.notebook_id
+    )
+
+    background_tasks.add_task(
+        retry_single_project_pipeline,
+        notebook_id=payload.notebook_id,
+        vector_store_id=payload.vector_store_id,
+        project_name=payload.project_name,
+        model_name=payload.model_name,
+        user_email=payload.user_email,
+    )
+
+    return RetryPipelineResponse(
+        status="accepted",
+        message="Pipeline retry initiated in background.",
+        notebook_id=payload.notebook_id,
+        vector_store_id=payload.vector_store_id,
+        project_name=payload.project_name,
+    )
 
 # --- Analytics Request Models & Endpoints ---------------------------------------
 class AnalyticsExtractRequest(BaseModel):

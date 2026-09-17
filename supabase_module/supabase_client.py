@@ -261,4 +261,26 @@ class SupabaseModule:
             logger.error("Failed to check vectors for collection '%s': %s", vector_store_id, exc)
             return False
 
+    def has_report(self, notebook_id: Optional[str] = None, vector_store_id: Optional[str] = None) -> bool:
+        """Check if a generated report already exists for a given notebook_id or vector_store_id."""
+        try:
+            if notebook_id:
+                res = self.client.table("reports").select("id").eq("notebook_id", notebook_id).limit(1).execute()
+                if res.data and len(res.data) > 0:
+                    return True
+
+            if vector_store_id:
+                nb_res = self.client.table("notebooks").select("id").eq("vector_store_id", vector_store_id).execute()
+                if nb_res.data:
+                    nb_ids = [row["id"] for row in nb_res.data if row.get("id")]
+                    if nb_ids:
+                        rep_res = self.client.table("reports").select("id").in_("notebook_id", nb_ids).limit(1).execute()
+                        if rep_res.data and len(rep_res.data) > 0:
+                            return True
+            return False
+        except Exception as exc:
+            logger.error("Failed to check existing report: %s", exc)
+            return False
+
+
 

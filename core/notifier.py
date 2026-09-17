@@ -123,74 +123,65 @@ def notify_frontend(
     try:
         from supabase_module.supabase_client import SupabaseModule
         import re
+        import uuid
         supabase_module = SupabaseModule()
         
         real_notebook_id = notebook_id
+        existing_nb = None
 
-        # 1. If notebook_id was provided, check if it already exists in Supabase
-        if real_notebook_id:
-            res = supabase_module.client.table("notebooks").select("id").eq("id", real_notebook_id).limit(1).execute()
-            if not res.data or len(res.data) == 0:
-                # Fallback: check by vector_store_id
-                vs_res = supabase_module.client.table("notebooks").select("id").eq("vector_store_id", vector_store_id).order("created_at", desc=True).limit(1).execute()
-                if vs_res.data and len(vs_res.data) > 0:
-                    real_notebook_id = vs_res.data[0]["id"]
-        else:
-            # Lookup existing notebook by vector_store_id
-            res = supabase_module.client.table("notebooks").select("id").eq("vector_store_id", vector_store_id).order("created_at", desc=True).limit(1).execute()
-            if res.data and len(res.data) > 0:
-                real_notebook_id = res.data[0]["id"]
+        # 1. Primary lookup: by vector_store_id (authoritative for collection identity)
+        if vector_store_id:
+            vs_res = (
+                supabase_module.client.table("notebooks")
+                .select("*")
+                .eq("vector_store_id", vector_store_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if vs_res.data and len(vs_res.data) > 0:
+                existing_nb = vs_res.data[0]
+                real_notebook_id = existing_nb["id"]
 
-        # 2. Update existing notebook or insert if completely missing
-        if real_notebook_id:
-            check_exists = supabase_module.client.table("notebooks").select("id").eq("id", real_notebook_id).limit(1).execute()
-            if check_exists.data and len(check_exists.data) > 0:
-                update_payload = {"status": status, "last_activity": datetime.now(timezone.utc).isoformat()}
-                if file_count > 0:
-                    update_payload["file_count"] = file_count
-                if tag:
-                    update_payload["tag"] = tag
+        # 2. Secondary lookup: by explicit notebook_id if not found via vector_store_id
+        if not existing_nb and real_notebook_id:
+            nb_res = (
+                supabase_module.client.table("notebooks")
+                .select("*")
+                .eq("id", real_notebook_id)
+                .limit(1)
+                .execute()
+            )
+            if nb_res.data and len(nb_res.data) > 0:
+                existing_nb = nb_res.data[0]
+
+        clean_name = re.sub(r'^\[[^\]]+\]\s*', '', project_name) if project_name else ""
+
+        # 3. Update existing notebook or insert if completely missing
+        if existing_nb:
+            update_payload: dict[str, Any] = {
+                "status": status,
+                "last_activity": datetime.now(timezone.utc).isoformat(),
+            }
+            if clean_name and clean_name != "Nuevo proyecto":
+                update_payload["name"] = clean_name
+            if file_count > 0:
+                update_payload["file_count"] = file_count
+            if tag:
+                update_payload["tag"] = tag
+            if vector_store_id and not existing_nb.get("vector_store_id"):
+                update_payload["vector_store_id"] = vector_store_id
+
+            try:
                 supabase_module.client.table("notebooks").update(update_payload).eq("id", real_notebook_id).execute()
-            else:
-                # Insert with the specific real_notebook_id
-                clean_name = re.sub(r'^\[[^\]]+\]\s*', '', project_name)
-                resolved_owner_id = None
-                try:
-                    profiles_res = supabase_module.client.table("profiles").select("id, email, tag").execute()
-                    if profiles_res.data:
-                        vs_prefix = vector_store_id.lower().split("_")[0] if vector_store_id else ""
-                        for p in profiles_res.data:
-                            p_email = (p.get("email") or "").lower()
-                            sanitized_email = re.sub(r'[^a-z0-9]', '', p_email)
-                            if sanitized_email and vs_prefix and sanitized_email == vs_prefix:
-                                resolved_owner_id = p.get("id")
-                                break
-                            if tag and p_email == tag.lower():
-                                resolved_owner_id = p.get("id")
-                                break
-                except Exception as p_err:
-                    logger.warning("Failed to resolve owner_id for notebook insert: %s", p_err)
-
-                nb_payload = {
-                    "id": real_notebook_id,
-                    "name": clean_name or project_name,
-                    "project_source": f"blob/{project_name.lower()}",
-                    "file_count": file_count,
-                    "status": status,
-                    "vector_store_id": vector_store_id,
-                    "tag": tag,
-                }
-                if resolved_owner_id:
-                    nb_payload["owner_id"] = resolved_owner_id
-
-                try:
-                    supabase_module.client.table("notebooks").insert(nb_payload).execute()
-                except Exception as nb_err:
-                    logger.error("Failed to insert notebook in Supabase: %s", nb_err)
+                logger.info("Notifier  │  ✓  Updated existing notebook '%s' (%s)", clean_name or real_notebook_id, real_notebook_id)
+            except Exception as upd_err:
+                logger.error("Failed to update notebook %s: %s", real_notebook_id, upd_err)
         else:
-            real_notebook_id = f"nb-{int(datetime.now(timezone.utc).timestamp()*1000)}"
-            clean_name = re.sub(r'^\[[^\]]+\]\s*', '', project_name)
-            
+            # Deterministic notebook ID
+            if not real_notebook_id:
+                real_notebook_id = f"nb-{vector_store_id}" if vector_store_id else str(uuid.uuid4())
+
             # Resolve owner_id from profiles
             resolved_owner_id = None
             try:
@@ -211,8 +202,8 @@ def notify_frontend(
 
             nb_payload = {
                 "id": real_notebook_id,
-                "name": clean_name or project_name,
-                "project_source": f"blob/{project_name.lower()}",
+                "name": clean_name or project_name or "Nuevo proyecto",
+                "project_source": f"blob/{project_name.lower()}" if project_name else "",
                 "file_count": file_count,
                 "status": status,
                 "vector_store_id": vector_store_id,
@@ -223,8 +214,22 @@ def notify_frontend(
 
             try:
                 supabase_module.client.table("notebooks").insert(nb_payload).execute()
+                logger.info("Notifier  │  ✓  Created new notebook '%s' (%s)", clean_name, real_notebook_id)
             except Exception as nb_err:
-                logger.error("Failed to auto-create notebook in Supabase: %s", nb_err)
+                # If unique constraint or conflict occurred, fallback to update
+                logger.warning("Failed to insert notebook (%s), attempting update on vector_store_id: %s", nb_err, vector_store_id)
+                if vector_store_id:
+                    try:
+                        upd_res = supabase_module.client.table("notebooks").select("id").eq("vector_store_id", vector_store_id).limit(1).execute()
+                        if upd_res.data:
+                            real_notebook_id = upd_res.data[0]["id"]
+                            supabase_module.client.table("notebooks").update({
+                                "status": status,
+                                "last_activity": datetime.now(timezone.utc).isoformat(),
+                                "file_count": file_count if file_count > 0 else 1,
+                            }).eq("id", real_notebook_id).execute()
+                    except Exception as fall_err:
+                        logger.error("Fallback update failed: %s", fall_err)
 
         # 3. Sync uploaded files
         if real_notebook_id and uploaded_files:
